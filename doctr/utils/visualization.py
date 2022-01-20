@@ -13,7 +13,7 @@ import mplcursors
 import numpy as np
 from matplotlib.figure import Figure
 from PIL import Image, ImageDraw
-from unidecode import unidecode
+
 
 from .common_types import BoundingBox, Polygon4P
 from .fonts import get_font
@@ -285,11 +285,8 @@ def synthesize_page(
                 img = Image.new('RGB', (xmax - xmin, ymax - ymin), color=(255, 255, 255))
                 d = ImageDraw.Draw(img)
                 # Draw in black the value of the word
-                try:
-                    d.text((0, 0), word["value"], font=font, fill=(0, 0, 0))
-                except UnicodeEncodeError:
-                    # When character cannot be encoded, use its unidecode version
-                    d.text((0, 0), unidecode(word["value"]), font=font, fill=(0, 0, 0))
+
+                d.text((0, 0), word["value"], font=font, fill=(0, 0, 0))
 
                 # Colorize if draw_proba
                 if draw_proba:
