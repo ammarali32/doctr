@@ -10,7 +10,6 @@ import numpy as np
 
 from doctr.utils.common_types import AbstractFile
 
-from .html import read_html
 from .image import read_img_as_numpy
 
 __all__ = ['DocumentFile']
