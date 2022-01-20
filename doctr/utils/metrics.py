@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
-from unidecode import unidecode
+
 
 __all__ = ['TextMatch', 'box_iou', 'box_ioa', 'mask_iou', 'polygon_iou',
            'nms', 'LocalizationConfusion', 'OCRMetric', 'DetectionMetric']
