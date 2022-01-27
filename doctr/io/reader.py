@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -12,12 +12,12 @@ from doctr.utils.common_types import AbstractFile
 
 from .image import read_img_as_numpy
 
+
 __all__ = ['DocumentFile']
 
 
 class DocumentFile:
     """Read a document from multiple extensions"""
-
 
     @classmethod
     def from_images(cls, files: Union[Sequence[AbstractFile], AbstractFile], **kwargs) -> List[np.ndarray]:

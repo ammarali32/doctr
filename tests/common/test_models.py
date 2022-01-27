@@ -1,4 +1,3 @@
-from copy import deepcopy
 from io import BytesIO
 
 import cv2
@@ -8,7 +7,6 @@ import requests
 
 from doctr.io import DocumentFile, reader
 from doctr.models._utils import estimate_orientation, extract_crops, extract_rcrops, get_bitmap_angle
-from doctr.utils import geometry
 
 
 def test_extract_crops(mock_pdf):  # noqa: F811
@@ -48,15 +46,13 @@ def test_extract_crops(mock_pdf):  # noqa: F811
 def test_extract_rcrops(mock_pdf):  # noqa: F811
     doc_img = DocumentFile.from_pdf(mock_pdf).as_images()[0]
     num_crops = 2
-    rel_boxes = np.array([[[idx / num_crops, idx / num_crops],
-                           [idx / num_crops + .1, idx / num_crops],
-                           [idx / num_crops + .1, idx / num_crops + .1],
-                           [idx / num_crops, idx / num_crops]]
+    rel_boxes = np.array([[idx / num_crops + .1, idx / num_crops + .1, .1, .1, 0]
                           for idx in range(num_crops)], dtype=np.float32)
-    abs_boxes = deepcopy(rel_boxes)
-    abs_boxes[:, :, 0] *= doc_img.shape[1]
-    abs_boxes[:, :, 1] *= doc_img.shape[0]
-    abs_boxes = abs_boxes.astype(np.int)
+    abs_boxes = np.array([[int((idx / num_crops + .1) * doc_img.shape[1]),
+                           int((idx / num_crops + .1) * doc_img.shape[0]),
+                           int(.1 * doc_img.shape[1]),
+                           int(.1 * doc_img.shape[0]), 0]
+                          for idx in range(num_crops)], dtype=np.int)
 
     with pytest.raises(AssertionError):
         extract_rcrops(doc_img, np.zeros((1, 8)))
@@ -69,7 +65,7 @@ def test_extract_rcrops(mock_pdf):  # noqa: F811
         assert all(crop.ndim == 3 for crop in croped_imgs)
 
     # No box
-    assert extract_rcrops(doc_img, np.zeros((0, 4, 2))) == []
+    assert extract_rcrops(doc_img, np.zeros((0, 5))) == []
 
 
 @pytest.fixture(scope="function")
@@ -95,11 +91,5 @@ def test_get_bitmap_angle(mock_bitmap):
 
 
 def test_estimate_orientation(mock_image):
-    assert estimate_orientation(mock_image * 0) == 0
-
     angle = estimate_orientation(mock_image)
     assert abs(angle - 30.) < 1.
-
-    rotated = geometry.rotate_image(mock_image, -angle)
-    angle_rotated = estimate_orientation(rotated)
-    assert abs(angle_rotated) < 1.

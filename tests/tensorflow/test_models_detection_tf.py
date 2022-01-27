@@ -4,7 +4,6 @@ import tensorflow as tf
 
 from doctr.io import DocumentFile
 from doctr.models import detection
-from doctr.models.detection._utils import dilate, erode
 from doctr.models.detection.predictor import DetectionPredictor
 from doctr.models.preprocessor import PreProcessor
 
@@ -12,15 +11,14 @@ from doctr.models.preprocessor import PreProcessor
 @pytest.mark.parametrize(
     "arch_name, input_shape, output_size, out_prob",
     [
-        ["db_resnet50", (512, 512, 3), (512, 512, 1), True],
-        ["db_mobilenet_v3_large", (512, 512, 3), (512, 512, 1), True],
-        ["linknet_resnet18", (512, 512, 3), (512, 512, 1), False],
+        ["db_resnet50", (1024, 1024, 3), (1024, 1024, 1), True],
+        ["db_mobilenet_v3_large", (1024, 1024, 3), (1024, 1024, 1), True],
+        ["linknet16", (1024, 1024, 3), (1024, 1024, 1), False],
     ],
 )
 def test_detection_models(arch_name, input_shape, output_size, out_prob):
     batch_size = 2
-    tf.keras.backend.clear_session()
-    model = detection.__dict__[arch_name](pretrained=True, input_shape=input_shape)
+    model = detection.__dict__[arch_name](pretrained=True)
     assert isinstance(model, tf.keras.Model)
     input_tensor = tf.random.uniform(shape=[batch_size, *input_shape], minval=0, maxval=1)
     target = [
@@ -28,7 +26,7 @@ def test_detection_models(arch_name, input_shape, output_size, out_prob):
         np.array([[.5, .5, 1, 1], [0.5, 0.5, .8, .9]], dtype=np.float32),
     ]
     # test training model
-    out = model(input_tensor, target, return_model_output=True, return_preds=True, training=True)
+    out = model(input_tensor, target, return_model_output=True, return_boxes=True, training=True)
     assert isinstance(out, dict)
     assert len(out) == 3
     # Check proba map
@@ -39,7 +37,7 @@ def test_detection_models(arch_name, input_shape, output_size, out_prob):
     if out_prob:
         assert np.all(np.logical_and(seg_map >= 0, seg_map <= 1))
     # Check boxes
-    for boxes in out['preds']:
+    for boxes in out['preds'][0]:
         assert boxes.shape[1] == 5
         assert np.all(boxes[:, :2] < boxes[:, 2:4])
         assert np.all(boxes[:, :4] >= 0) and np.all(boxes[:, :4] <= 1)
@@ -60,14 +58,6 @@ def test_detection_models(arch_name, input_shape, output_size, out_prob):
     with pytest.raises(ValueError):
         out = model(input_tensor, target, training=True)
 
-    # Check the rotated case
-    target = [
-        np.array([[.75, .75, .5, .5, 0], [.65, .65, .3, .3, 0]], dtype=np.float32),
-        np.array([[.75, .75, .5, .5, 0], [.65, .7, .3, .4, 0]], dtype=np.float32),
-    ]
-    loss = model(input_tensor, target, training=True)['loss']
-    assert isinstance(loss, tf.Tensor) and ((loss - out['loss']) / loss).numpy() < 21e-2
-
 
 @pytest.fixture(scope="session")
 def test_detectionpredictor(mock_pdf):  # noqa: F811
@@ -80,8 +70,9 @@ def test_detectionpredictor(mock_pdf):  # noqa: F811
 
     pages = DocumentFile.from_pdf(mock_pdf).as_images()
     out = predictor(pages)
-    # The input PDF has 2 pages
-    assert len(out) == 2
+    out, _ = zip(*out)
+    # The input PDF has 8 pages
+    assert len(out) == 8
 
     # Dimension check
     with pytest.raises(ValueError):
@@ -97,14 +88,14 @@ def test_rotated_detectionpredictor(mock_pdf):  # noqa: F811
     batch_size = 4
     predictor = DetectionPredictor(
         PreProcessor(output_size=(512, 512), batch_size=batch_size),
-        detection.db_resnet50(assume_straight_pages=False, input_shape=(512, 512, 3))
+        detection.db_resnet50(rotated_bbox=True, input_shape=(512, 512, 3))
     )
 
     pages = DocumentFile.from_pdf(mock_pdf).as_images()
     out = predictor(pages)
 
-    # The input PDF has 2 pages
-    assert len(out) == 2
+    # The input PDF has 8 pages
+    assert len(out) == 8
 
     # Dimension check
     with pytest.raises(ValueError):
@@ -119,18 +110,19 @@ def test_rotated_detectionpredictor(mock_pdf):  # noqa: F811
     [
         "db_resnet50",
         "db_mobilenet_v3_large",
-        "linknet_resnet18",
+        "linknet16",
     ],
 )
 def test_detection_zoo(arch_name):
     # Model
-    tf.keras.backend.clear_session()
     predictor = detection.zoo.detection_predictor(arch_name, pretrained=False)
     # object check
     assert isinstance(predictor, DetectionPredictor)
     input_tensor = tf.random.uniform(shape=[2, 1024, 1024, 3], minval=0, maxval=1)
     out = predictor(input_tensor)
-    assert all(isinstance(boxes, np.ndarray) and boxes.shape[1] == 5 for boxes in out)
+    assert all(isinstance(out_img, tuple) for out_img in out)
+    all_boxes, _ = zip(*out)
+    assert all(isinstance(boxes, np.ndarray) and boxes.shape[1] == 5 for boxes in all_boxes)
 
 
 def test_detection_zoo_error():
@@ -138,19 +130,15 @@ def test_detection_zoo_error():
         _ = detection.zoo.detection_predictor("my_fancy_model", pretrained=False)
 
 
-def test_erode():
-    x = np.zeros((1, 3, 3, 1), dtype=np.float32)
-    x[:, 1, 1] = 1
-    x = tf.convert_to_tensor(x)
-    expected = tf.zeros((1, 3, 3, 1))
-    out = erode(x, 3)
-    assert tf.math.reduce_all(out == expected)
-
-
-def test_dilate():
-    x = np.zeros((1, 3, 3, 1), dtype=np.float32)
-    x[:, 1, 1] = 1
-    x = tf.convert_to_tensor(x)
-    expected = tf.ones((1, 3, 3, 1))
-    out = dilate(x, 3)
-    assert tf.math.reduce_all(out == expected)
+def test_linknet_focal_loss():
+    batch_size = 2
+    input_shape = (1024, 1024, 3)
+    model = detection.linknet16(pretrained=True)
+    input_tensor = tf.random.uniform(shape=[batch_size, *input_shape], minval=0, maxval=1)
+    target = [
+        np.array([[.5, .5, 1, 1], [0.5, 0.5, .8, .8]], dtype=np.float32),
+        np.array([[.5, .5, 1, 1], [0.5, 0.5, .8, .9]], dtype=np.float32),
+    ]
+    # test focal loss
+    out = model(input_tensor, target, return_model_output=True, return_boxes=True, training=True, focal_loss=True)
+    assert isinstance(out['loss'], tf.Tensor)

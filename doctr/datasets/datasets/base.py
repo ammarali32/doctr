@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -8,7 +8,6 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
-from doctr.io.image import get_img_shape
 from doctr.utils.data import download_from_url
 
 __all__ = ['_AbstractDataset', '_VisionDataset']
@@ -17,29 +16,25 @@ __all__ = ['_AbstractDataset', '_VisionDataset']
 class _AbstractDataset:
 
     data: List[Any] = []
-    _pre_transforms: Optional[Callable[[Any, Any], Tuple[Any, Any]]] = None
 
     def __init__(
         self,
         root: Union[str, Path],
-        img_transforms: Optional[Callable[[Any], Any]] = None,
-        sample_transforms: Optional[Callable[[Any, Any], Tuple[Any, Any]]] = None,
-        pre_transforms: Optional[Callable[[Any, Any], Tuple[Any, Any]]] = None,
     ) -> None:
 
         if not Path(root).is_dir():
             raise ValueError(f'expected a path to a reachable folder: {root}')
 
         self.root = root
-        self.img_transforms = img_transforms
-        self.sample_transforms = sample_transforms
-        self._pre_transforms = pre_transforms
-        self._get_img_shape = get_img_shape
 
     def __len__(self) -> int:
         return len(self.data)
 
     def _read_sample(self, index: int) -> Tuple[Any, Any]:
+        raise NotImplementedError
+
+    @staticmethod
+    def _get_img_shape(img: Any) -> Tuple[int, int]:
         raise NotImplementedError
 
     def __getitem__(
@@ -49,16 +44,10 @@ class _AbstractDataset:
 
         # Read image
         img, target = self._read_sample(index)
-        # Pre-transforms (format conversion at run-time etc.)
-        if self._pre_transforms is not None:
-            img, target = self._pre_transforms(img, target)
-
-        if self.img_transforms is not None:
-            # typing issue cf. https://github.com/python/mypy/issues/5485
-            img = self.img_transforms(img)  # type: ignore[call-arg]
-
+        self.sample_transforms: Optional[Callable[[Any], Any]]
         if self.sample_transforms is not None:
-            img, target = self.sample_transforms(img, target)
+            # typing issue cf. https://github.com/python/mypy/issues/5485
+            img = self.sample_transforms(img)  # type: ignore[call-arg]
 
         return img, target
 
@@ -79,8 +68,6 @@ class _VisionDataset(_AbstractDataset):
         extract_archive: whether the downloaded file is an archive to be extracted
         download: whether the dataset should be downloaded if not present on disk
         overwrite: whether the archive should be re-extracted
-        cache_dir: cache directory
-        cache_subdir: subfolder to use in the cache
     """
 
     def __init__(
@@ -91,22 +78,18 @@ class _VisionDataset(_AbstractDataset):
         extract_archive: bool = False,
         download: bool = False,
         overwrite: bool = False,
-        cache_dir: Optional[str] = None,
-        cache_subdir: Optional[str] = None,
-        **kwargs: Any,
     ) -> None:
 
-        cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'doctr') if cache_dir is None else cache_dir
-        cache_subdir = 'datasets' if cache_subdir is None else cache_subdir
+        dataset_cache = os.path.join(os.path.expanduser('~'), '.cache', 'doctr', 'datasets')
 
         file_name = file_name if isinstance(file_name, str) else os.path.basename(url)
         # Download the file if not present
-        archive_path: Union[str, Path] = os.path.join(cache_dir, cache_subdir, file_name)
+        archive_path: Union[str, Path] = os.path.join(dataset_cache, file_name)
 
         if not os.path.exists(archive_path) and not download:
             raise ValueError("the dataset needs to be downloaded first with download=True")
 
-        archive_path = download_from_url(url, file_name, file_hash, cache_dir=cache_dir, cache_subdir=cache_subdir)
+        archive_path = download_from_url(url, file_name, file_hash, cache_subdir='datasets')
 
         # Extract the archive
         if extract_archive:
@@ -115,4 +98,4 @@ class _VisionDataset(_AbstractDataset):
             if not dataset_path.is_dir() or overwrite:
                 shutil.unpack_archive(archive_path, dataset_path)
 
-        super().__init__(dataset_path if extract_archive else archive_path, **kwargs)
+        super().__init__(dataset_path if extract_archive else archive_path)

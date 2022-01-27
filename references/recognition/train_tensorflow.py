@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -10,93 +10,38 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import datetime
 import hashlib
-import multiprocessing as mp
 import time
 from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
-import wandb
 from fastprogress.fastprogress import master_bar, progress_bar
-from tensorflow.keras import mixed_precision
+
+import wandb
 
 gpu_devices = tf.config.experimental.list_physical_devices('GPU')
 if any(gpu_devices):
     tf.config.experimental.set_memory_growth(gpu_devices[0], True)
 
+from utils import plot_samples
+
 from doctr import transforms as T
 from doctr.datasets import VOCABS, DataLoader, RecognitionDataset
 from doctr.models import recognition
 from doctr.utils.metrics import TextMatch
-from utils import plot_recorder, plot_samples
 
 
-def record_lr(
-    model: tf.keras.Model,
-    train_loader: DataLoader,
-    batch_transforms,
-    optimizer,
-    start_lr: float = 1e-7,
-    end_lr: float = 1,
-    num_it: int = 100,
-    amp: bool = False,
-):
-    """Gridsearch the optimal learning rate for the training.
-    Adapted from https://github.com/frgfm/Holocron/blob/master/holocron/trainer/core.py
-    """
-
-    if num_it > len(train_loader):
-        raise ValueError("the value of `num_it` needs to be lower than the number of available batches")
-
-    # Update param groups & LR
-    gamma = (end_lr / start_lr) ** (1 / (num_it - 1))
-    optimizer.learning_rate = start_lr
-
-    lr_recorder = [start_lr * gamma ** idx for idx in range(num_it)]
-    loss_recorder = []
-
-    for batch_idx, (images, targets) in enumerate(train_loader):
-
-        images = batch_transforms(images)
-
-        # Forward, Backward & update
-        with tf.GradientTape() as tape:
-            train_loss = model(images, targets, training=True)['loss']
-        grads = tape.gradient(train_loss, model.trainable_weights)
-
-        if amp:
-            grads = optimizer.get_unscaled_gradients(grads)
-        optimizer.apply_gradients(zip(grads, model.trainable_weights))
-
-        optimizer.learning_rate = optimizer.learning_rate * gamma
-
-        # Record
-        train_loss = train_loss.numpy()
-        if np.any(np.isnan(train_loss)):
-            if batch_idx == 0:
-                raise ValueError("loss value is NaN or inf.")
-            else:
-                break
-        loss_recorder.append(train_loss.mean())
-        # Stop after the number of iterations
-        if batch_idx + 1 == num_it:
-            break
-
-    return lr_recorder[:len(loss_recorder)], loss_recorder
-
-
-def fit_one_epoch(model, train_loader, batch_transforms, optimizer, mb, amp=False):
+def fit_one_epoch(model, train_loader, batch_transforms, optimizer, mb):
     train_iter = iter(train_loader)
     # Iterate over the batches of the dataset
-    for images, targets in progress_bar(train_iter, parent=mb):
+    for batch_step in progress_bar(range(train_loader.num_batches), parent=mb):
+        images, targets = next(train_iter)
 
         images = batch_transforms(images)
 
         with tf.GradientTape() as tape:
             train_loss = model(images, targets, training=True)['loss']
         grads = tape.gradient(train_loss, model.trainable_weights)
-        if amp:
-            grads = optimizer.get_unscaled_gradients(grads)
         optimizer.apply_gradients(zip(grads, model.trainable_weights))
 
         mb.child.comment = f'Training loss: {train_loss.numpy().mean():.6}'
@@ -130,27 +75,14 @@ def main(args):
 
     print(args)
 
-    if not isinstance(args.workers, int):
-        args.workers = min(16, mp.cpu_count())
-
-    # AMP
-    if args.amp:
-        mixed_precision.set_global_policy('mixed_float16')
-
     # Load val data generator
     st = time.time()
     val_set = RecognitionDataset(
         img_folder=os.path.join(args.val_path, 'images'),
         labels_path=os.path.join(args.val_path, 'labels.json'),
-        img_transforms=T.Resize((args.input_size, 4 * args.input_size), preserve_aspect_ratio=True),
+        sample_transforms=T.Resize((args.input_size, 4 * args.input_size), preserve_aspect_ratio=True),
     )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        drop_last=False,
-        num_workers=args.workers,
-    )
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, drop_last=False, workers=args.workers)
     print(f"Validation set loaded in {time.time() - st:.4}s ({len(val_set)} samples in "
           f"{val_loader.num_batches} batches)")
     with open(os.path.join(args.val_path, 'labels.json'), 'rb') as f:
@@ -189,7 +121,7 @@ def main(args):
     train_set = RecognitionDataset(
         parts[0].joinpath('images'),
         parts[0].joinpath('labels.json'),
-        img_transforms=T.Compose([
+        sample_transforms=T.Compose([
             T.RandomApply(T.ColorInversion(), .1),
             T.Resize((args.input_size, 4 * args.input_size), preserve_aspect_ratio=True),
             # Augmentations
@@ -204,13 +136,7 @@ def main(args):
         for subfolder in parts[1:]:
             train_set.merge_dataset(RecognitionDataset(subfolder.joinpath('images'), subfolder.joinpath('labels.json')))
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=args.workers,
-    )
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, drop_last=True, workers=args.workers)
     print(f"Train set loaded in {time.time() - st:.4}s ({len(train_set)} samples in "
           f"{train_loader.num_batches} batches)")
     with open(parts[0].joinpath('labels.json'), 'rb') as f:
@@ -235,13 +161,6 @@ def main(args):
         epsilon=1e-6,
         clipnorm=5
     )
-    if args.amp:
-        optimizer = mixed_precision.LossScaleOptimizer(optimizer)
-    # LR Finder
-    if args.find_lr:
-        lrs, losses = record_lr(model, train_loader, batch_transforms, optimizer, amp=args.amp)
-        plot_recorder(lrs, losses)
-        return
 
     # Tensorboard to monitor training
     current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -256,13 +175,13 @@ def main(args):
             config={
                 "learning_rate": args.lr,
                 "epochs": args.epochs,
-                "weight_decay": 0.,
+                "weight_decay": args.weight_decay,
                 "batch_size": args.batch_size,
                 "architecture": args.arch,
                 "input_size": args.input_size,
                 "optimizer": "adam",
                 "framework": "tensorflow",
-                "scheduler": "exp_decay",
+                "scheduler": args.sched,
                 "vocab": args.vocab,
                 "train_hash": train_hash,
                 "val_hash": val_hash,
@@ -275,7 +194,7 @@ def main(args):
     # Training loop
     mb = master_bar(range(args.epochs))
     for epoch in mb:
-        fit_one_epoch(model, train_loader, batch_transforms, optimizer, mb, args.amp)
+        fit_one_epoch(model, train_loader, batch_transforms, optimizer, mb)
 
         # Validation loop at the end of each epoch
         val_loss, exact_match, partial_match = evaluate(model, val_loader, batch_transforms, val_metric)
@@ -310,7 +229,7 @@ def parse_args():
     parser.add_argument('-b', '--batch_size', type=int, default=64, help='batch size for training')
     parser.add_argument('--input_size', type=int, default=32, help='input size H for the model, W = 4*H')
     parser.add_argument('--lr', type=float, default=0.001, help='learning rate for the optimizer (Adam)')
-    parser.add_argument('-j', '--workers', type=int, default=None, help='number of workers used for dataloading')
+    parser.add_argument('-j', '--workers', type=int, default=4, help='number of workers used for dataloading')
     parser.add_argument('--resume', type=str, default=None, help='Path to your checkpoint')
     parser.add_argument('--vocab', type=str, default="french", help='Vocab to be used for training')
     parser.add_argument("--test-only", dest='test_only', action='store_true', help="Run the validation loop")
@@ -320,8 +239,6 @@ def parse_args():
                         help='Log to Weights & Biases')
     parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                         help='Load pretrained parameters before starting the training')
-    parser.add_argument("--amp", dest="amp", help="Use Automatic Mixed Precision", action="store_true")
-    parser.add_argument('--find-lr', action='store_true', help='Gridsearch the optimal LR')
     args = parser.parse_args()
 
     return args

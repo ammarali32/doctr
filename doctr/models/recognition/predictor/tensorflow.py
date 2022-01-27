@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -41,7 +41,7 @@ class RecognitionPredictor(NestedObject):
         self.split_wide_crops = split_wide_crops
         self.critical_ar = 8  # Critical aspect ratio
         self.dil_factor = 1.4  # Dilation factor to overlap the crops
-        self.target_ar = 6  # Target aspect ratio
+        self.target_ar = 4  # Target aspect ratio
 
     def __call__(
         self,

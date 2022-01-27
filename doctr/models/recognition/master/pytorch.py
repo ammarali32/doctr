@@ -1,24 +1,23 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
 
+import math
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torchvision.models._utils import IntermediateLayerGetter
 
-from doctr.datasets import VOCABS
-from doctr.models.classification import magc_resnet31
-
-from ...utils.pytorch import load_pretrained_params
-from ..transformer.pytorch import Decoder, positional_encoding
+from ....datasets import VOCABS
+from ...backbones import resnet_stage
+from ...utils import conv_sequence_pt, load_pretrained_params
+from ..transformer import Decoder, positional_encoding
 from .base import _MASTER, _MASTERPostProcessor
 
-__all__ = ['MASTER', 'master']
+__all__ = ['MASTER', 'master', 'MASTERPostProcessor']
 
 
 default_cfgs: Dict[str, Dict[str, Any]] = {
@@ -26,36 +25,151 @@ default_cfgs: Dict[str, Dict[str, Any]] = {
         'mean': (.5, .5, .5),
         'std': (1., 1., 1.),
         'input_shape': (3, 48, 160),
-        'vocab': VOCABS['french'],
+        'vocab': VOCABS['legacy_french'],
         'url': None,
     },
 }
 
 
+class MAGC(nn.Module):
+
+    """Implements the Multi-Aspect Global Context Attention, as described in
+    <https://arxiv.org/pdf/1910.02562.pdf>`_.
+
+    Args:
+        inplanes: input channels
+        headers: number of headers to split channels
+        att_scale: if True, re-scale attention to counteract the variance distibutions
+        **kwargs
+    """
+
+    def __init__(
+        self,
+        inplanes: int,
+        headers: int = 8,
+        att_scale: bool = False,
+        ratio: float = 0.0625,  # bottleneck ratio of 1/16 as described in paper
+    ) -> None:
+        super().__init__()
+
+        self.headers = headers  # h
+        self.inplanes = inplanes  # C
+        self.att_scale = att_scale
+        self.planes = int(inplanes * ratio)
+
+        self.single_header_inplanes = int(inplanes / headers)  # C / h
+
+        self.conv_mask = nn.Conv2d(self.single_header_inplanes, 1, kernel_size=1)
+        self.softmax = nn.Softmax(dim=2)
+
+        self.channel_add_conv = nn.Sequential(
+            nn.Conv2d(self.inplanes, self.planes, kernel_size=1),
+            nn.LayerNorm([self.planes, 1, 1]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.planes, self.inplanes, kernel_size=1)
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+
+        batch, _, height, width = inputs.size()
+        # [N*headers, C', H , W] C = headers * C'
+        x = inputs.view(batch * self.headers, self.single_header_inplanes, height, width)
+        shortcut = x
+
+        # [N*headers, C', H * W] C = headers * C'
+        # input_x = input_x.view(batch, channel, height * width)
+        shortcut = shortcut.view(batch * self.headers, self.single_header_inplanes, height * width)
+
+        # [N*headers, 1, C', H * W]
+        shortcut = shortcut.unsqueeze(1)
+        # [N*headers, 1, H, W]
+        context_mask = self.conv_mask(x)
+        # [N*headers, 1, H * W]
+        context_mask = context_mask.view(batch * self.headers, 1, height * width)
+
+        # scale variance
+        if self.att_scale and self.headers > 1:
+            context_mask = context_mask / math.sqrt(self.single_header_inplanes)
+
+        # [N*headers, 1, H * W]
+        context_mask = self.softmax(context_mask)
+
+        # [N*headers, 1, H * W, 1]
+        context_mask = context_mask.unsqueeze(-1)
+        # [N*headers, 1, C', 1] = [N*headers, 1, C', H * W] * [N*headers, 1, H * W, 1]
+        context = torch.matmul(shortcut, context_mask)
+
+        # [N, headers * C', 1, 1]
+        context = context.view(batch, self.headers * self.single_header_inplanes, 1, 1)
+
+        # Transform: B, C, 1, 1 ->  B, C, 1, 1
+        transformed = self.channel_add_conv(context)
+        return inputs + transformed
+
+
+class MAGCResnet(nn.Sequential):
+
+    """Implements the modified resnet with MAGC layers, as described in paper.
+
+    Args:
+        headers: number of header to split channels in MAGC layers
+        input_shape: shape of the model input (without batch dim)
+    """
+
+    def __init__(
+        self,
+        headers: int = 8,
+    ) -> None:
+        _layers = [
+            # conv_1x
+            *conv_sequence_pt(3, 64, relu=True, bn=True, kernel_size=3, padding=1),
+            *conv_sequence_pt(64, 128, relu=True, bn=True, kernel_size=3, padding=1),
+            nn.MaxPool2d(2),
+            # conv_2x
+            *resnet_stage(128, 256, num_blocks=1),
+            MAGC(inplanes=256, headers=headers, att_scale=True),
+            *conv_sequence_pt(256, 256, relu=True, bn=True, kernel_size=3, padding=1),
+            nn.MaxPool2d(2),
+            # conv_3x
+            *resnet_stage(256, 512, num_blocks=2),
+            MAGC(inplanes=512, headers=headers, att_scale=True),
+            *conv_sequence_pt(512, 512, relu=True, bn=True, kernel_size=3, padding=1),
+            nn.MaxPool2d((2, 1)),
+            # conv_4x
+            *resnet_stage(512, 512, num_blocks=5),
+            MAGC(inplanes=512, headers=headers, att_scale=True),
+            *conv_sequence_pt(512, 512, relu=True, bn=True, kernel_size=3, padding=1),
+            # conv_5x
+            *resnet_stage(512, 512, num_blocks=3),
+            MAGC(inplanes=512, headers=headers, att_scale=True),
+            *conv_sequence_pt(512, 512, relu=True, bn=True, kernel_size=3, padding=1),
+        ]
+        super().__init__(*_layers)
+
+
 class MASTER(_MASTER, nn.Module):
+
     """Implements MASTER as described in paper: <https://arxiv.org/pdf/1910.02562.pdf>`_.
     Implementation based on the official Pytorch implementation: <https://github.com/wenwenyu/MASTER-pytorch>`_.
 
     Args:
-        feature_extractor: the backbone serving as feature extractor
         vocab: vocabulary, (without EOS, SOS, PAD)
         d_model: d parameter for the transformer decoder
+        headers: headers for the MAGC module
         dff: depth of the pointwise feed-forward layer
         num_heads: number of heads for the mutli-head attention module
         num_layers: number of decoder layers to stack
         max_length: maximum length of character sequence handled by the model
-        dropout: dropout probability of the decoder
-        input_shape: size of the image inputs
-        cfg: dictionary containing information about the model
+        input_size: size of the image inputs
     """
 
     feature_pe: torch.Tensor
 
     def __init__(
         self,
-        feature_extractor: nn.Module,
         vocab: str,
         d_model: int = 512,
+        headers: int = 8,  # number of multi-aspect context
         dff: int = 2048,
         num_heads: int = 8,  # number of heads in the transformer decoder
         num_layers: int = 3,
@@ -72,7 +186,7 @@ class MASTER(_MASTER, nn.Module):
         self.vocab_size = len(vocab)
         self.num_heads = num_heads
 
-        self.feat_extractor = feature_extractor
+        self.feat_extractor = MAGCResnet(headers=headers)
         self.seq_embedding = nn.Embedding(self.vocab_size + 3, d_model)  # 3 more for EOS/SOS/PAD
 
         self.decoder = Decoder(
@@ -89,10 +203,7 @@ class MASTER(_MASTER, nn.Module):
 
         self.postprocessor = MASTERPostProcessor(vocab=self.vocab)
 
-        for n, m in self.named_modules():
-            # Don't override the initialization of the backbone
-            if n.startswith('feat_extractor.'):
-                continue
+        for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
@@ -106,8 +217,8 @@ class MASTER(_MASTER, nn.Module):
         combined_mask = target_padding_mask | look_ahead_mask
         return torch.tile(combined_mask.permute(1, 0, 2), (self.num_heads, 1, 1))
 
-    @staticmethod
     def compute_loss(
+        self,
         model_output: torch.Tensor,
         gt: torch.Tensor,
         seq_len: torch.Tensor,
@@ -152,22 +263,22 @@ class MASTER(_MASTER, nn.Module):
             return_model_output: if True, return logits
             return_preds: if True, decode logits
 
-        Returns:
+        Return:
             A torch tensor, containing logits
         """
 
         # Encode
-        features = self.feat_extractor(x)['features']
-        b, c, h, w = features.shape[:4]
-        # --> (N, H * W, C)
-        features = features.reshape((b, c, h * w)).permute(0, 2, 1)
-        encoded = features + self.feature_pe[:, :h * w, :]
+        feature = self.feat_extractor(x)
+        b, c, h, w = (feature.size(i) for i in range(4))
+        feature = torch.reshape(feature, shape=(b, c, h * w))
+        feature = feature.permute(0, 2, 1)  # shape (b, h*w, c)
+        encoded = feature + self.feature_pe[:, :h * w, :]
 
         out: Dict[str, Any] = {}
 
         if target is not None:
             # Compute target: tensor of gts and sequence lengths
-            _gt, _seq_len = self.build_target(target)
+            _gt, _seq_len = self.compute_target(target)
             gt, seq_len = torch.from_numpy(_gt).to(dtype=torch.long), torch.tensor(_seq_len)
             gt, seq_len = gt.to(x.device), seq_len.to(x.device)
 
@@ -246,31 +357,17 @@ class MASTERPostProcessor(_MASTERPostProcessor):
         return list(zip(word_values, probs.numpy().tolist()))
 
 
-def _master(
-    arch: str,
-    pretrained: bool,
-    backbone_fn: Callable[[bool], nn.Module],
-    layer: str,
-    pretrained_backbone: bool = True,
-    **kwargs: Any
-) -> MASTER:
-
-    pretrained_backbone = pretrained_backbone and not pretrained
+def _master(arch: str, pretrained: bool, input_shape: Tuple[int, int, int] = None, **kwargs: Any) -> MASTER:
 
     # Patch the config
     _cfg = deepcopy(default_cfgs[arch])
-    _cfg['input_shape'] = kwargs.get('input_shape', _cfg['input_shape'])
+    _cfg['input_shape'] = input_shape or _cfg['input_shape']
     _cfg['vocab'] = kwargs.get('vocab', _cfg['vocab'])
 
     kwargs['vocab'] = _cfg['vocab']
-    kwargs['input_shape'] = _cfg['input_shape']
 
     # Build the model
-    feat_extractor = IntermediateLayerGetter(
-        backbone_fn(pretrained_backbone),
-        {layer: 'features'},
-    )
-    model = MASTER(feat_extractor, cfg=_cfg, **kwargs)
+    model = MASTER(cfg=_cfg, **kwargs)
     # Load pretrained parameters
     if pretrained:
         load_pretrained_params(model, default_cfgs[arch]['url'])
@@ -292,4 +389,4 @@ def master(pretrained: bool = False, **kwargs: Any) -> MASTER:
         text recognition architecture
     """
 
-    return _master('master', pretrained, magc_resnet31, '10', **kwargs)
+    return _master('master', pretrained, **kwargs)

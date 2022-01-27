@@ -34,10 +34,10 @@ def test_documentbuilder():
     out = doc_builder([boxes, boxes], [[], []], [(100, 200), (100, 200)])
     assert len(out.pages[0].blocks) == 0
 
-    # Rotated boxes to export as straight boxes
+    # Rotated boxes to export à straight boxes
     boxes = np.array([
-        [[0.1, 0.1], [0.2, 0.2], [0.15, 0.25], [0.05, 0.15]],
-        [[0.5, 0.5], [0.6, 0.6], [0.55, 0.65], [0.45, 0.55]],
+        [0.25, 0.25, np.sqrt(2) / 4, np.sqrt(2) / 4, 45, 0.99],
+        [0.75, 0.75, np.sqrt(2) / 4, np.sqrt(2) / 4, 45, 0.99],
     ])
     doc_builder_2 = builder.DocumentBuilder(
         resolve_blocks=False,
@@ -45,7 +45,7 @@ def test_documentbuilder():
         export_as_straight_boxes=True
     )
     out = doc_builder_2([boxes], [[("hello", 0.99), ("world", 0.99)]], [(100, 100)])
-    assert out.pages[0].blocks[0].lines[0].words[-1].geometry == ((0.45, 0.5), (0.6, 0.65))
+    assert out.pages[0].blocks[0].lines[0].words[-1].geometry == ((0.5, 0.5), (1.0, 1.0))
 
     # Repr
     assert repr(doc_builder) == "DocumentBuilder(resolve_lines=True, " \
@@ -61,13 +61,12 @@ def test_documentbuilder():
         [[[0, 0.5, 0.1, 0.6], [0.2, 0.49, 0.35, 0.59], [0.8, 0.52, 0.9, 0.63]], [0, 1, 2]],  # ~same line
         [[[0, 0.3, 0.4, 0.45], [0.5, 0.28, 0.75, 0.42], [0, 0.45, 0.1, 0.55]], [0, 1, 2]],  # 2 lines
         [[[0, 0.3, 0.4, 0.35], [0.75, 0.28, 0.95, 0.42], [0, 0.45, 0.1, 0.55]], [0, 1, 2]],  # 2 lines
-        [[[[.1, .1], [.2, .2], [.15, .25], [.05, .15]], [[.5, .5], [.6, .6], [.55, .65], [.45, .55]]], [0, 1]],  # rot
     ],
 )
 def test_sort_boxes(input_boxes, sorted_idxs):
 
     doc_builder = builder.DocumentBuilder()
-    assert doc_builder._sort_boxes(np.asarray(input_boxes))[0].tolist() == sorted_idxs
+    assert doc_builder._sort_boxes(np.asarray(input_boxes)).tolist() == sorted_idxs
 
 
 @pytest.mark.parametrize(
@@ -79,11 +78,6 @@ def test_sort_boxes(input_boxes, sorted_idxs):
         [[[0, 0.5, 0.18, 0.6], [0.2, 0.48, 0.35, 0.58], [0.8, 0.52, 0.9, 0.63]], [[0, 1], [2]]],  # ~same line
         [[[0, 0.3, 0.48, 0.45], [0.5, 0.28, 0.75, 0.42], [0, 0.45, 0.1, 0.55]], [[0, 1], [2]]],  # 2 lines
         [[[0, 0.3, 0.4, 0.35], [0.75, 0.28, 0.95, 0.42], [0, 0.45, 0.1, 0.55]], [[0], [1], [2]]],  # 2 lines
-        [
-            [[[.1, .1], [.2, .2], [.15, .25], [.05, .15]],
-             [[.5, .5], [.6, .6], [.55, .65], [.45, .55]]],
-            [[0], [1]]
-        ],  # rot
     ],
 )
 def test_resolve_lines(input_boxes, lines):

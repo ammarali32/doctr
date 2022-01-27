@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -46,8 +46,7 @@ class DataLoader:
         shuffle: whether the samples should be shuffled before passing it to the iterator
         batch_size: number of elements in each batch
         drop_last: if `True`, drops the last batch if it isn't full
-        num_workers: number of workers to use for data loading
-        collate_fn: function to merge samples into a batch
+        workers: number of workers to use for data loading
     """
 
     def __init__(
@@ -56,7 +55,7 @@ class DataLoader:
         shuffle: bool = True,
         batch_size: int = 1,
         drop_last: bool = False,
-        num_workers: Optional[int] = None,
+        workers: Optional[int] = None,
         collate_fn: Optional[Callable] = None,
     ) -> None:
         self.dataset = dataset
@@ -68,7 +67,7 @@ class DataLoader:
             self.collate_fn = self.dataset.collate_fn if hasattr(self.dataset, 'collate_fn') else default_collate
         else:
             self.collate_fn = collate_fn
-        self.num_workers = num_workers
+        self.workers = workers
         self.reset()
 
     def __len__(self) -> int:
@@ -91,7 +90,7 @@ class DataLoader:
             idx = self._num_yielded * self.batch_size
             indices = self.indices[idx: min(len(self.dataset), idx + self.batch_size)]
 
-            samples = multithread_exec(self.dataset.__getitem__, indices, threads=self.num_workers)
+            samples = multithread_exec(self.dataset.__getitem__, indices, threads=self.workers)
 
             batch_data = self.collate_fn(samples)
 

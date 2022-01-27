@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -44,9 +44,8 @@ class DetectionPredictor(nn.Module):
             raise ValueError("incorrect input shape: all pages are expected to be multi-channel 2D images.")
 
         processed_batches = self.pre_processor(pages)
-        _device = next(self.model.parameters()).device
         predicted_batches = [
-            self.model(batch.to(device=_device), return_preds=True, **kwargs)['preds']  # type:ignore[operator]
+            self.model(batch, return_boxes=True, **kwargs)['preds']  # type:ignore[operator]
             for batch in processed_batches
         ]
-        return [pred for batch in predicted_batches for pred in batch]
+        return [pred for batch in predicted_batches for pred in zip(*batch)]

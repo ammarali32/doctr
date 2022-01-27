@@ -11,6 +11,11 @@ pip install -e . --upgrade
 pip install -r references/requirements.txt
 ```
 
+if you are using PyTorch back-end, there is an extra dependency (to optimize data loading):
+```shell
+pip install contiguous-params>=1.0.0
+```
+
 ## Usage
 
 You can start your training in TensorFlow:

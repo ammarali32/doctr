@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -15,89 +15,18 @@ import time
 
 import numpy as np
 import torch
-import wandb
+from contiguous_params import ContiguousParams
 from fastprogress.fastprogress import master_bar, progress_bar
-from torch.optim.lr_scheduler import CosineAnnealingLR, MultiplicativeLR, OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torchvision.transforms import ColorJitter, Compose, Normalize
+from utils import plot_samples
 
+import wandb
 from doctr import transforms as T
 from doctr.datasets import DetectionDataset
 from doctr.models import detection
 from doctr.utils.metrics import LocalizationConfusion
-from utils import plot_recorder, plot_samples
-
-
-def record_lr(
-    model: torch.nn.Module,
-    train_loader: DataLoader,
-    batch_transforms,
-    optimizer,
-    start_lr: float = 1e-7,
-    end_lr: float = 1,
-    num_it: int = 100,
-    amp: bool = False,
-):
-    """Gridsearch the optimal learning rate for the training.
-    Adapted from https://github.com/frgfm/Holocron/blob/master/holocron/trainer/core.py
-    """
-
-    if num_it > len(train_loader):
-        raise ValueError("the value of `num_it` needs to be lower than the number of available batches")
-
-    model = model.train()
-    # Update param groups & LR
-    optimizer.defaults['lr'] = start_lr
-    for pgroup in optimizer.param_groups:
-        pgroup['lr'] = start_lr
-
-    gamma = (end_lr / start_lr) ** (1 / (num_it - 1))
-    scheduler = MultiplicativeLR(optimizer, lambda step: gamma)
-
-    lr_recorder = [start_lr * gamma ** idx for idx in range(num_it)]
-    loss_recorder = []
-
-    if amp:
-        scaler = torch.cuda.amp.GradScaler()
-
-    for batch_idx, (images, targets) in enumerate(train_loader):
-        if torch.cuda.is_available():
-            images = images.cuda()
-
-        images = batch_transforms(images)
-
-        # Forward, Backward & update
-        optimizer.zero_grad()
-        if amp:
-            with torch.cuda.amp.autocast():
-                train_loss = model(images, targets)['loss']
-            scaler.scale(train_loss).backward()
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
-            # Update the params
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            train_loss = model(images, targets)['loss']
-            train_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
-            optimizer.step()
-        # Update LR
-        scheduler.step()
-
-        # Record
-        if not torch.isfinite(train_loss):
-            if batch_idx == 0:
-                raise ValueError("loss value is NaN or inf.")
-            else:
-                break
-        loss_recorder.append(train_loss.item())
-        # Stop after the number of iterations
-        if batch_idx + 1 == num_it:
-            break
-
-    return lr_recorder[:len(loss_recorder)], loss_recorder
 
 
 def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, mb, amp=False):
@@ -106,8 +35,10 @@ def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, m
         scaler = torch.cuda.amp.GradScaler()
 
     model.train()
+    train_iter = iter(train_loader)
     # Iterate over the batches of the dataset
-    for images, targets in progress_bar(train_loader, parent=mb):
+    for _ in progress_bar(range(len(train_loader)), parent=mb):
+        images, targets = next(train_iter)
 
         if torch.cuda.is_available():
             images = images.cuda()
@@ -143,22 +74,21 @@ def evaluate(model, val_loader, batch_transforms, val_metric, amp=False):
     val_metric.reset()
     # Validation loop
     val_loss, batch_cnt = 0, 0
-    for images, targets in val_loader:
+    val_iter = iter(val_loader)
+    for images, targets in val_iter:
         if torch.cuda.is_available():
             images = images.cuda()
         images = batch_transforms(images)
         if amp:
             with torch.cuda.amp.autocast():
-                out = model(images, targets, return_preds=True)
+                out = model(images, targets, return_boxes=True)
         else:
-            out = model(images, targets, return_preds=True)
+            out = model(images, targets, return_boxes=True)
         # Compute metric
-        loc_preds = out['preds']
+        loc_preds, _ = out['preds']
         for boxes_gt, boxes_pred in zip(targets, loc_preds):
-            if args.rotation and args.eval_straight:
-                # Convert pred to boxes [xmin, ymin, xmax, ymax]  N, 4, 2 --> N, 4
-                boxes_pred = np.concatenate((boxes_pred.min(axis=1), boxes_pred.max(axis=1)), axis=-1)
-            val_metric.update(gts=boxes_gt, preds=boxes_pred[:, :4])
+            # Remove scores
+            val_metric.update(gts=boxes_gt, preds=boxes_pred[:, :-1])
 
         val_loss += out['loss'].item()
         batch_cnt += 1
@@ -181,8 +111,8 @@ def main(args):
     val_set = DetectionDataset(
         img_folder=os.path.join(args.val_path, 'images'),
         label_path=os.path.join(args.val_path, 'labels.json'),
-        img_transforms=T.Resize((args.input_size, args.input_size)),
-        use_polygons=args.rotation and not args.eval_straight,
+        sample_transforms=T.Resize((args.input_size, args.input_size)),
+        rotated_bbox=args.rotation
     )
     val_loader = DataLoader(
         val_set,
@@ -201,7 +131,7 @@ def main(args):
     batch_transforms = Normalize(mean=(0.798, 0.785, 0.772), std=(0.264, 0.2749, 0.287))
 
     # Load doctr model
-    model = detection.__dict__[args.arch](pretrained=args.pretrained, assume_straight_pages=not args.rotation)
+    model = detection.__dict__[args.arch](pretrained=args.pretrained)
 
     # Resume weights
     if isinstance(args.resume, str):
@@ -225,14 +155,11 @@ def main(args):
         model = model.cuda()
 
     # Metrics
-    val_metric = LocalizationConfusion(
-        use_polygons=args.rotation and not args.eval_straight,
-        mask_shape=(args.input_size, args.input_size)
-    )
+    val_metric = LocalizationConfusion(rotated_bbox=args.rotation, mask_shape=(args.input_size, args.input_size))
 
     if args.test_only:
         print("Running evaluation")
-        val_loss, recall, precision, mean_iou = evaluate(model, val_loader, batch_transforms, val_metric, amp=args.amp)
+        val_loss, recall, precision, mean_iou = evaluate(model, val_loader, batch_transforms, val_metric)
         print(f"Validation loss: {val_loss:.6} (Recall: {recall:.2%} | Precision: {precision:.2%} | "
               f"Mean IoU: {mean_iou:.2%})")
         return
@@ -242,19 +169,13 @@ def main(args):
     train_set = DetectionDataset(
         img_folder=os.path.join(args.train_path, 'images'),
         label_path=os.path.join(args.train_path, 'labels.json'),
-        img_transforms=Compose(
-            ([T.Resize((args.input_size, args.input_size))] if not args.rotation else [])
-            + [
-                # Augmentations
-                T.RandomApply(T.ColorInversion(), .1),
-                ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.02),
-            ]
-        ),
-        sample_transforms=T.SampleCompose([
-            T.RandomRotate(90, expand=True),
-            T.ImageTransform(T.Resize((args.input_size, args.input_size))),
-        ]) if args.rotation else None,
-        use_polygons=args.rotation,
+        sample_transforms=Compose([
+            T.Resize((args.input_size, args.input_size)),
+            # Augmentations
+            T.RandomApply(T.ColorInversion(), .1),
+            ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.02),
+        ]),
+        rotated_bbox=args.rotation
     )
 
     train_loader = DataLoader(
@@ -282,13 +203,9 @@ def main(args):
             p.reguires_grad_(False)
 
     # Optimizer
-    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], args.lr,
+    model_params = ContiguousParams([p for p in model.parameters() if p.requires_grad]).contiguous()
+    optimizer = torch.optim.Adam(model_params, args.lr,
                                  betas=(0.95, 0.99), eps=1e-6, weight_decay=args.weight_decay)
-    # LR Finder
-    if args.find_lr:
-        lrs, losses = record_lr(model, train_loader, batch_transforms, optimizer, amp=args.amp)
-        plot_recorder(lrs, losses)
-        return
     # Scheduler
     if args.sched == 'cosine':
         scheduler = CosineAnnealingLR(optimizer, args.epochs * len(train_loader), eta_min=args.lr / 25e4)
@@ -382,12 +299,9 @@ def parse_args():
     parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                         help='Load pretrained parameters before starting the training')
     parser.add_argument('--rotation', dest='rotation', action='store_true',
-                        help='train with rotated documents')
-    parser.add_argument('--eval-straight', action='store_true',
-                        help='metrics evaluation with straight boxes instead of polygons to save time + memory')
+                        help='train with rotated bbox')
     parser.add_argument('--sched', type=str, default='cosine', help='scheduler to use')
     parser.add_argument("--amp", dest="amp", help="Use Automatic Mixed Precision", action="store_true")
-    parser.add_argument('--find-lr', action='store_true', help='Gridsearch the optimal LR')
     args = parser.parse_args()
 
     return args

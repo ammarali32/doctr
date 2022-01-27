@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -6,12 +6,11 @@
 import csv
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .datasets import VisionDataset
-from .utils import convert_target_to_relative
 
 __all__ = ['SROIE']
 
@@ -27,7 +26,8 @@ class SROIE(VisionDataset):
 
     Args:
         train: whether the subset should be the training one
-        use_polygons: whether polygons should be considered as rotated bounding box (instead of straight ones)
+        sample_transforms: composable transformations that will be applied to each image
+        rotated_bbox: whether polygons should be considered as rotated bounding box (instead of straight ones)
         **kwargs: keyword arguments from `VisionDataset`.
     """
 
@@ -39,40 +39,45 @@ class SROIE(VisionDataset):
     def __init__(
         self,
         train: bool = True,
-        use_polygons: bool = False,
+        sample_transforms: Optional[Callable[[Any], Any]] = None,
+        rotated_bbox: bool = False,
         **kwargs: Any,
     ) -> None:
 
         url, sha256 = self.TRAIN if train else self.TEST
-        super().__init__(url, None, sha256, True, pre_transforms=convert_target_to_relative, **kwargs)
+        super().__init__(url, None, sha256, True, **kwargs)
+        self.sample_transforms = sample_transforms
         self.train = train
 
+        if rotated_bbox:
+            raise NotImplementedError
+
+        # # List images
         tmp_root = os.path.join(self.root, 'images')
         self.data: List[Tuple[str, Dict[str, Any]]] = []
         np_dtype = np.float32
-
         for img_path in os.listdir(tmp_root):
-
             # File existence check
             if not os.path.exists(os.path.join(tmp_root, img_path)):
                 raise FileNotFoundError(f"unable to locate {os.path.join(tmp_root, img_path)}")
-
             stem = Path(img_path).stem
+            _targets = []
             with open(os.path.join(self.root, 'annotations', f"{stem}.txt"), encoding='latin') as f:
-                _rows = [row for row in list(csv.reader(f, delimiter=',')) if len(row) > 0]
+                for row in csv.reader(f, delimiter=','):
+                    # Safeguard for blank lines
+                    if len(row) > 0:
+                        # Label may contain commas
+                        label = ",".join(row[8:])
+                        # Reduce 8 coords to 4
+                        p1_x, p1_y, p2_x, p2_y, p3_x, p3_y, p4_x, p4_y = map(int, row[:8])
+                        left, right = min(p1_x, p2_x, p3_x, p4_x), max(p1_x, p2_x, p3_x, p4_x)
+                        top, bot = min(p1_y, p2_y, p3_y, p4_y), max(p1_y, p2_y, p3_y, p4_y)
+                        if len(label) > 0:
+                            _targets.append((label, [left, top, right, bot]))
 
-            labels = [",".join(row[8:]) for row in _rows]
-            # reorder coordinates (8 -> (4,2) ->
-            # (x, y) coordinates of top left, top right, bottom right, bottom left corners) and filter empty lines
-            coords = np.stack([np.array(list(map(int, row[:8])), dtype=np_dtype).reshape((4, 2))
-                              for row in _rows], axis=0)
+            text_targets, box_targets = zip(*_targets)
 
-            if not use_polygons:
-                # xmin, ymin, xmax, ymax
-                coords = np.concatenate((coords.min(axis=1), coords.max(axis=1)), axis=1)
-
-            self.data.append((img_path, dict(boxes=coords, labels=labels)))
-
+            self.data.append((img_path, dict(boxes=np.asarray(box_targets, dtype=np_dtype), labels=text_targets)))
         self.root = tmp_root
 
     def extra_repr(self) -> str:

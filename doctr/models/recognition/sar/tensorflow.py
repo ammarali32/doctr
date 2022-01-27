@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -9,19 +9,20 @@ from typing import Any, Dict, List, Optional, Tuple
 import tensorflow as tf
 from tensorflow.keras import Model, Sequential, layers
 
-from doctr.datasets import VOCABS
 from doctr.utils.repr import NestedObject
 
-from ...classification import resnet31
-from ...utils.tensorflow import load_pretrained_params
+from ....datasets import VOCABS
+from ...backbones import resnet31
+from ...utils import load_pretrained_params
 from ..core import RecognitionModel, RecognitionPostProcessor
 
-__all__ = ['SAR', 'sar_resnet31']
+__all__ = ['SAR', 'SARPostProcessor', 'sar_resnet31']
 
 default_cfgs: Dict[str, Dict[str, Any]] = {
     'sar_resnet31': {
         'mean': (0.694, 0.695, 0.693),
         'std': (0.299, 0.296, 0.301),
+        'backbone': resnet31, 'rnn_units': 512, 'max_length': 30, 'num_decoders': 2,
         'input_shape': (32, 128, 3),
         'vocab': VOCABS['legacy_french'],
         'url': 'https://github.com/mindee/doctr/releases/download/v0.3.0/sar_resnet31-9ee49970.zip',
@@ -212,8 +213,8 @@ class SAR(Model, RecognitionModel):
 
         self.postprocessor = SARPostProcessor(vocab=vocab)
 
-    @staticmethod
     def compute_loss(
+        self,
         model_output: tf.Tensor,
         gt: tf.Tensor,
         seq_len: tf.Tensor,
@@ -257,7 +258,7 @@ class SAR(Model, RecognitionModel):
         pooled_features = tf.reduce_max(features, axis=1)  # vertical max pooling
         encoded = self.encoder(pooled_features, **kwargs)
         if target is not None:
-            gt, seq_len = self.build_target(target)
+            gt, seq_len = self.compute_target(target)
             seq_len = tf.cast(seq_len, tf.int32)
         decoded_features = self.decoder(features, encoded, gt=None if target is None else gt, **kwargs)
 
@@ -309,9 +310,8 @@ class SARPostProcessor(RecognitionPostProcessor):
 def _sar(
     arch: str,
     pretrained: bool,
-    backbone_fn,
     pretrained_backbone: bool = True,
-    input_shape: Optional[Tuple[int, int, int]] = None,
+    input_shape: Tuple[int, int, int] = None,
     **kwargs: Any
 ) -> SAR:
 
@@ -321,15 +321,25 @@ def _sar(
     _cfg = deepcopy(default_cfgs[arch])
     _cfg['input_shape'] = input_shape or _cfg['input_shape']
     _cfg['vocab'] = kwargs.get('vocab', _cfg['vocab'])
+    _cfg['rnn_units'] = kwargs.get('rnn_units', _cfg['rnn_units'])
+    _cfg['embedding_units'] = kwargs.get('embedding_units', _cfg['rnn_units'])
+    _cfg['attention_units'] = kwargs.get('attention_units', _cfg['rnn_units'])
+    _cfg['max_length'] = kwargs.get('max_length', _cfg['max_length'])
+    _cfg['num_decoders'] = kwargs.get('num_decoders', _cfg['num_decoders'])
 
     # Feature extractor
-    feat_extractor = backbone_fn(
-        pretrained=pretrained_backbone,
+    feat_extractor = default_cfgs[arch]['backbone'](
         input_shape=_cfg['input_shape'],
+        pretrained=pretrained_backbone,
         include_top=False,
     )
 
     kwargs['vocab'] = _cfg['vocab']
+    kwargs['rnn_units'] = _cfg['rnn_units']
+    kwargs['embedding_units'] = _cfg['embedding_units']
+    kwargs['attention_units'] = _cfg['attention_units']
+    kwargs['max_length'] = _cfg['max_length']
+    kwargs['num_decoders'] = _cfg['num_decoders']
 
     # Build the model
     model = SAR(feat_extractor, cfg=_cfg, **kwargs)
@@ -358,4 +368,4 @@ def sar_resnet31(pretrained: bool = False, **kwargs: Any) -> SAR:
         text recognition architecture
     """
 
-    return _sar('sar_resnet31', pretrained, resnet31, **kwargs)
+    return _sar('sar_resnet31', pretrained, **kwargs)

@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -16,31 +16,18 @@ def _predictor(
     det_arch: str,
     reco_arch: str,
     pretrained: bool,
-    assume_straight_pages: bool = True,
-    preserve_aspect_ratio: bool = False,
     det_bs: int = 2,
     reco_bs: int = 128,
     **kwargs,
 ) -> OCRPredictor:
 
     # Detection
-    det_predictor = detection_predictor(
-        det_arch,
-        pretrained=pretrained,
-        batch_size=det_bs,
-        assume_straight_pages=assume_straight_pages,
-        preserve_aspect_ratio=preserve_aspect_ratio,
-    )
+    det_predictor = detection_predictor(det_arch, pretrained=pretrained, batch_size=det_bs)
 
     # Recognition
     reco_predictor = recognition_predictor(reco_arch, pretrained=pretrained, batch_size=reco_bs)
 
-    return OCRPredictor(
-        det_predictor,
-        reco_predictor,
-        assume_straight_pages=assume_straight_pages,
-        **kwargs
-    )
+    return OCRPredictor(det_predictor, reco_predictor, **kwargs)
 
 
 def ocr_predictor(
@@ -48,7 +35,6 @@ def ocr_predictor(
     reco_arch: str = 'crnn_vgg16_bn',
     pretrained: bool = False,
     assume_straight_pages: bool = True,
-    preserve_aspect_ratio: bool = False,
     export_as_straight_boxes: bool = False,
     **kwargs: Any
 ) -> OCRPredictor:
@@ -67,11 +53,8 @@ def ocr_predictor(
         pretrained: If True, returns a model pre-trained on our OCR dataset
         assume_straight_pages: if True, speeds up the inference by assuming you only pass straight pages
             without rotated textual elements.
-        preserve_aspect_ratio: If True, pad the input document image to preserve the aspect ratio before
-            running the detection model on it.
         export_as_straight_boxes: when assume_straight_pages is set to False, export final predictions
             (potentially rotated) as straight bounding boxes.
-        kwargs: keyword args of `OCRPredictor`
 
     Returns:
         OCR predictor
@@ -82,7 +65,6 @@ def ocr_predictor(
         reco_arch,
         pretrained,
         assume_straight_pages=assume_straight_pages,
-        preserve_aspect_ratio=preserve_aspect_ratio,
         export_as_straight_boxes=export_as_straight_boxes,
         **kwargs,
     )

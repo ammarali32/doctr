@@ -1,16 +1,19 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
 
 # Credits: post-processing adapted from https://github.com/xuannianz/DifferentiableBinarization
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 import pyclipper
 from shapely.geometry import Polygon
+
+from doctr.utils.common_types import RotatedBbox
+from doctr.utils.geometry import fit_rbbox, rbbox_to_polygon
 
 from ..core import DetectionPostProcessor
 
@@ -33,40 +36,30 @@ class DBPostProcessor(DetectionPostProcessor):
         self,
         box_thresh: float = 0.1,
         bin_thresh: float = 0.3,
-        assume_straight_pages: bool = True,
+        rotated_bbox: bool = False,
     ) -> None:
 
         super().__init__(
             box_thresh,
             bin_thresh,
-            assume_straight_pages
+            rotated_bbox
         )
-        self.unclip_ratio = 1.5 if assume_straight_pages else 2.2
+        self.unclip_ratio = 2.2 if self.rotated_bbox else 1.5
 
     def polygon_to_box(
         self,
         points: np.ndarray,
-    ) -> np.ndarray:
-        """Expand a polygon (points) by a factor unclip_ratio, and returns a polygon
+    ) -> Optional[Union[RotatedBbox, Tuple[float, float, float, float]]]:
+        """Expand a polygon (points) by a factor unclip_ratio, and returns a rotated box: x, y, w, h, alpha
 
         Args:
             points: The first parameter.
 
         Returns:
-            a box in absolute coordinates (xmin, ymin, xmax, ymax) or (4, 2) array (quadrangle)
+            a box in absolute coordinates (xmin, ymin, xmax, ymax) or (x, y, w, h, alpha)
         """
-        if not self.assume_straight_pages:
-            # Compute the rectangle polygon enclosing the raw polygon
-            rect = cv2.minAreaRect(points)
-            points = cv2.boxPoints(rect)
-            # Add 1 pixel to correct cv2 approx
-            area = (rect[1][0] + 1) * (1 + rect[1][1])
-            length = 2 * (rect[1][0] + rect[1][1]) + 2
-        else:
-            poly = Polygon(points)
-            area = poly.area
-            length = poly.length
-        distance = area * self.unclip_ratio / length  # compute distance to expand polygon
+        poly = Polygon(points)
+        distance = poly.area * self.unclip_ratio / poly.length  # compute distance to expand polygon
         offset = pyclipper.PyclipperOffset()
         offset.AddPath(points, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
         _points = offset.Execute(distance)
@@ -83,9 +76,7 @@ class DBPostProcessor(DetectionPostProcessor):
         expanded_points = np.asarray(_points)  # expand polygon
         if len(expanded_points) < 1:
             return None
-        return cv2.boundingRect(expanded_points) if self.assume_straight_pages else np.roll(
-            cv2.boxPoints(cv2.minAreaRect(expanded_points)), -1, axis=0
-        )
+        return fit_rbbox(expanded_points) if self.rotated_bbox else cv2.boundingRect(expanded_points)
 
     def bitmap_to_boxes(
         self,
@@ -97,8 +88,6 @@ class DBPostProcessor(DetectionPostProcessor):
         Args:
             pred: Pred map from differentiable binarization output
             bitmap: Bitmap map computed from pred (binarized)
-            angle_tol: Comparison tolerance of the angle with the median angle across the page
-            ratio_tol: Under this limit aspect ratio, we cannot resolve the direction of the crop
 
         Returns:
             np tensor boxes for the bitmap, each box is a 5-element list
@@ -114,43 +103,38 @@ class DBPostProcessor(DetectionPostProcessor):
             if np.any(contour[:, 0].max(axis=0) - contour[:, 0].min(axis=0) < min_size_box):
                 continue
             # Compute objectness
-            if self.assume_straight_pages:
+            if self.rotated_bbox:
+                score = self.box_score(pred, contour, rotated_bbox=True)
+            else:
                 x, y, w, h = cv2.boundingRect(contour)
                 points = np.array([[x, y], [x, y + h], [x + w, y + h], [x + w, y]])
-                score = self.box_score(pred, points, assume_straight_pages=True)
-            else:
-                score = self.box_score(pred, contour, assume_straight_pages=False)
+                score = self.box_score(pred, points, rotated_bbox=False)
 
-            if score < self.box_thresh:   # remove polygons with a weak objectness
+            if self.box_thresh > score:   # remove polygons with a weak objectness
                 continue
 
-            if self.assume_straight_pages:
-                _box = self.polygon_to_box(points)
-            else:
-                _box = self.polygon_to_box(np.squeeze(contour))
+            _box = self.polygon_to_box(np.squeeze(contour)) if self.rotated_bbox else self.polygon_to_box(points)
 
-            # Remove too small boxes
-            if self.assume_straight_pages:
-                if _box is None or _box[2] < min_size_box or _box[3] < min_size_box:
-                    continue
-            elif np.linalg.norm(_box[2, :] - _box[0, :], axis=-1) < min_size_box:
+            if _box is None or _box[2] < min_size_box or _box[3] < min_size_box:  # remove to small boxes
                 continue
 
-            if self.assume_straight_pages:
+            if self.rotated_bbox:
+                x, y, w, h, alpha = _box  # type: ignore[misc]
+                # compute relative box to get rid of img shape
+                x, y, w, h = x / width, y / height, w / width, h / height
+                boxes.append([x, y, w, h, alpha, score])
+            else:
                 x, y, w, h = _box  # type: ignore[misc]
                 # compute relative polygon to get rid of img shape
                 xmin, ymin, xmax, ymax = x / width, y / height, (x + w) / width, (y + h) / height
                 boxes.append([xmin, ymin, xmax, ymax, score])
-            else:
-                # compute relative box to get rid of img shape, in that case _box is a 4pt polygon
-                if not isinstance(_box, np.ndarray) and _box.shape == (4, 2):
-                    raise AssertionError("When assume straight pages is false a box is a (4, 2) array (polygon)")
-                _box[:, 0] /= width
-                _box[:, 1] /= height
-                boxes.append(_box)
 
-        if not self.assume_straight_pages:
-            return np.clip(np.asarray(boxes), 0, 1) if len(boxes) > 0 else np.zeros((0, 4, 2), dtype=pred.dtype)
+        if self.rotated_bbox:
+            if len(boxes) == 0:
+                return np.zeros((0, 6), dtype=pred.dtype)
+            coord = np.clip(np.asarray(boxes)[:, :4], 0, 1)  # clip boxes coordinates
+            boxes = np.concatenate((coord, np.asarray(boxes)[:, 4:]), axis=1)
+            return boxes
         else:
             return np.clip(np.asarray(boxes), 0, 1) if len(boxes) > 0 else np.zeros((0, 5), dtype=pred.dtype)
 
@@ -168,7 +152,7 @@ class _DBNet:
     thresh_min = 0.3
     thresh_max = 0.7
     min_size_box = 3
-    assume_straight_pages: bool = True
+    rotated_bbox: bool = False
 
     @staticmethod
     def compute_distance(
@@ -266,7 +250,7 @@ class _DBNet:
 
         return polygon, canvas, mask
 
-    def build_target(
+    def compute_target(
         self,
         target: List[np.ndarray],
         output_shape: Tuple[int, int, int],
@@ -281,7 +265,7 @@ class _DBNet:
 
         seg_target = np.zeros(output_shape, dtype=np.uint8)
         seg_mask = np.ones(output_shape, dtype=bool)
-        thresh_target = np.zeros(output_shape, dtype=np.float32)
+        thresh_target = np.zeros(output_shape, dtype=np.uint8)
         thresh_mask = np.ones(output_shape, dtype=np.uint8)
 
         for idx, _target in enumerate(target):
@@ -292,23 +276,23 @@ class _DBNet:
 
             # Absolute bounding boxes
             abs_boxes = _target.copy()
-            if abs_boxes.ndim == 3:
-                abs_boxes[:, :, 0] *= output_shape[-1]
-                abs_boxes[:, :, 1] *= output_shape[-2]
-                polys = abs_boxes
-                boxes_size = np.linalg.norm(abs_boxes[:, 2, :] - abs_boxes[:, 0, :], axis=-1)
-                abs_boxes = np.concatenate((abs_boxes.min(1), abs_boxes.max(1)), -1).round().astype(np.int32)
+            abs_boxes[:, [0, 2]] *= output_shape[-1]
+            abs_boxes[:, [1, 3]] *= output_shape[-2]
+            abs_boxes = abs_boxes.round().astype(np.int32)
+
+            if abs_boxes.shape[1] == 5:
+                boxes_size = np.minimum(abs_boxes[:, 2], abs_boxes[:, 3])
+                polys = np.stack([
+                    rbbox_to_polygon(tuple(rbbox)) for rbbox in abs_boxes  # type: ignore[arg-type]
+                ], axis=1)
             else:
-                abs_boxes[:, [0, 2]] *= output_shape[-1]
-                abs_boxes[:, [1, 3]] *= output_shape[-2]
-                abs_boxes = abs_boxes.round().astype(np.int32)
+                boxes_size = np.minimum(abs_boxes[:, 2] - abs_boxes[:, 0], abs_boxes[:, 3] - abs_boxes[:, 1])
                 polys = np.stack([
                     abs_boxes[:, [0, 1]],
                     abs_boxes[:, [0, 3]],
                     abs_boxes[:, [2, 3]],
                     abs_boxes[:, [2, 1]],
                 ], axis=1)
-                boxes_size = np.minimum(abs_boxes[:, 2] - abs_boxes[:, 0], abs_boxes[:, 3] - abs_boxes[:, 1])
 
             for box, box_size, poly in zip(abs_boxes, boxes_size, polys):
                 # Mask boxes that are too small
@@ -326,11 +310,11 @@ class _DBNet:
 
                 # Draw polygon on gt if it is valid
                 if len(shrinked) == 0:
-                    seg_mask[idx, box[1]: box[3] + 1, box[0]: box[2] + 1] = False
+                    seg_mask[box[1]: box[3] + 1, box[0]: box[2] + 1] = False
                     continue
                 shrinked = np.array(shrinked[0]).reshape(-1, 2)
                 if shrinked.shape[0] <= 2 or not Polygon(shrinked).is_valid:
-                    seg_mask[idx, box[1]: box[3] + 1, box[0]: box[2] + 1] = False
+                    seg_mask[box[1]: box[3] + 1, box[0]: box[2] + 1] = False
                     continue
                 cv2.fillPoly(seg_target[idx], [shrinked.astype(np.int32)], 1)
 

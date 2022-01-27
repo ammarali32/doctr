@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -16,89 +16,18 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import wandb
+from contiguous_params import ContiguousParams
 from fastprogress.fastprogress import master_bar, progress_bar
-from torch.optim.lr_scheduler import CosineAnnealingLR, MultiplicativeLR, OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torchvision.transforms import ColorJitter, Compose, Normalize
+from utils import plot_samples
 
+import wandb
 from doctr import transforms as T
 from doctr.datasets import VOCABS, RecognitionDataset
 from doctr.models import recognition
 from doctr.utils.metrics import TextMatch
-from utils import plot_recorder, plot_samples
-
-
-def record_lr(
-    model: torch.nn.Module,
-    train_loader: DataLoader,
-    batch_transforms,
-    optimizer,
-    start_lr: float = 1e-7,
-    end_lr: float = 1,
-    num_it: int = 100,
-    amp: bool = False,
-):
-    """Gridsearch the optimal learning rate for the training.
-    Adapted from https://github.com/frgfm/Holocron/blob/master/holocron/trainer/core.py
-    """
-
-    if num_it > len(train_loader):
-        raise ValueError("the value of `num_it` needs to be lower than the number of available batches")
-
-    model = model.train()
-    # Update param groups & LR
-    optimizer.defaults['lr'] = start_lr
-    for pgroup in optimizer.param_groups:
-        pgroup['lr'] = start_lr
-
-    gamma = (end_lr / start_lr) ** (1 / (num_it - 1))
-    scheduler = MultiplicativeLR(optimizer, lambda step: gamma)
-
-    lr_recorder = [start_lr * gamma ** idx for idx in range(num_it)]
-    loss_recorder = []
-
-    if amp:
-        scaler = torch.cuda.amp.GradScaler()
-
-    for batch_idx, (images, targets) in enumerate(train_loader):
-        if torch.cuda.is_available():
-            images = images.cuda()
-
-        images = batch_transforms(images)
-
-        # Forward, Backward & update
-        optimizer.zero_grad()
-        if amp:
-            with torch.cuda.amp.autocast():
-                train_loss = model(images, targets)['loss']
-            scaler.scale(train_loss).backward()
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
-            # Update the params
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            train_loss = model(images, targets)['loss']
-            train_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
-            optimizer.step()
-        # Update LR
-        scheduler.step()
-
-        # Record
-        if not torch.isfinite(train_loss):
-            if batch_idx == 0:
-                raise ValueError("loss value is NaN or inf.")
-            else:
-                break
-        loss_recorder.append(train_loss.item())
-        # Stop after the number of iterations
-        if batch_idx + 1 == num_it:
-            break
-
-    return lr_recorder[:len(loss_recorder)], loss_recorder
 
 
 def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, mb, amp=False):
@@ -107,8 +36,10 @@ def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, m
         scaler = torch.cuda.amp.GradScaler()
 
     model.train()
+    train_iter = iter(train_loader)
     # Iterate over the batches of the dataset
-    for images, targets in progress_bar(train_loader, parent=mb):
+    for _ in progress_bar(range(len(train_loader)), parent=mb):
+        images, targets = next(train_iter)
 
         if torch.cuda.is_available():
             images = images.cuda()
@@ -146,7 +77,8 @@ def evaluate(model, val_loader, batch_transforms, val_metric, amp=False):
     val_metric.reset()
     # Validation loop
     val_loss, batch_cnt = 0, 0
-    for images, targets in val_loader:
+    val_iter = iter(val_loader)
+    for images, targets in val_iter:
         if torch.cuda.is_available():
             images = images.cuda()
         images = batch_transforms(images)
@@ -184,7 +116,7 @@ def main(args):
     val_set = RecognitionDataset(
         img_folder=os.path.join(args.val_path, 'images'),
         labels_path=os.path.join(args.val_path, 'labels.json'),
-        img_transforms=T.Resize((args.input_size, 4 * args.input_size), preserve_aspect_ratio=True),
+        sample_transforms=T.Resize((args.input_size, 4 * args.input_size), preserve_aspect_ratio=True),
     )
     val_loader = DataLoader(
         val_set,
@@ -231,7 +163,7 @@ def main(args):
 
     if args.test_only:
         print("Running evaluation")
-        val_loss, exact_match, partial_match = evaluate(model, val_loader, batch_transforms, val_metric, amp=args.amp)
+        val_loss, exact_match, partial_match = evaluate(model, val_loader, batch_transforms, val_metric)
         print(f"Validation loss: {val_loss:.6} (Exact: {exact_match:.2%} | Partial: {partial_match:.2%})")
         return
 
@@ -245,7 +177,7 @@ def main(args):
     train_set = RecognitionDataset(
         parts[0].joinpath('images'),
         parts[0].joinpath('labels.json'),
-        img_transforms=Compose([
+        sample_transforms=Compose([
             T.Resize((args.input_size, 4 * args.input_size), preserve_aspect_ratio=True),
             # Augmentations
             T.RandomApply(T.ColorInversion(), .1),
@@ -276,13 +208,9 @@ def main(args):
         return
 
     # Optimizer
-    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], args.lr,
+    model_params = ContiguousParams([p for p in model.parameters() if p.requires_grad]).contiguous()
+    optimizer = torch.optim.Adam(model_params, args.lr,
                                  betas=(0.95, 0.99), eps=1e-6, weight_decay=args.weight_decay)
-    # LR Finder
-    if args.find_lr:
-        lrs, losses = record_lr(model, train_loader, batch_transforms, optimizer, amp=args.amp)
-        plot_recorder(lrs, losses)
-        return
     # Scheduler
     if args.sched == 'cosine':
         scheduler = CosineAnnealingLR(optimizer, args.epochs * len(train_loader), eta_min=args.lr / 25e4)
@@ -321,10 +249,10 @@ def main(args):
     # Training loop
     mb = master_bar(range(args.epochs))
     for epoch in mb:
-        fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, mb, amp=args.amp)
+        fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, mb)
 
         # Validation loop at the end of each epoch
-        val_loss, exact_match, partial_match = evaluate(model, val_loader, batch_transforms, val_metric, amp=args.amp)
+        val_loss, exact_match, partial_match = evaluate(model, val_loader, batch_transforms, val_metric)
         if val_loss < min_loss:
             print(f"Validation loss decreased {min_loss:.6} --> {val_loss:.6}: saving state...")
             torch.save(model.state_dict(), f"./{exp_name}.pt")
@@ -370,7 +298,6 @@ def parse_args():
                         help='Load pretrained parameters before starting the training')
     parser.add_argument('--sched', type=str, default='cosine', help='scheduler to use')
     parser.add_argument("--amp", dest="amp", help="Use Automatic Mixed Precision", action="store_true")
-    parser.add_argument('--find-lr', action='store_true', help='Gridsearch the optimal LR')
     args = parser.parse_args()
 
     return args

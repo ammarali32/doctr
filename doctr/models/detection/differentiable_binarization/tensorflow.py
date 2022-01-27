@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -17,7 +17,7 @@ from tensorflow.keras.applications import ResNet50
 from doctr.models.utils import IntermediateLayerGetter, conv_sequence, load_pretrained_params
 from doctr.utils.repr import NestedObject
 
-from ...classification import mobilenet_v3_large
+from ...backbones import mobilenet_v3_large
 from .base import DBPostProcessor, _DBNet
 
 __all__ = ['DBNet', 'db_resnet50', 'db_mobilenet_v3_large']
@@ -27,12 +27,16 @@ default_cfgs: Dict[str, Dict[str, Any]] = {
     'db_resnet50': {
         'mean': (0.798, 0.785, 0.772),
         'std': (0.264, 0.2749, 0.287),
+        'backbone': ResNet50,
+        'fpn_layers': ["conv2_block3_out", "conv3_block4_out", "conv4_block6_out", "conv5_block3_out"],
         'input_shape': (1024, 1024, 3),
         'url': 'https://github.com/mindee/doctr/releases/download/v0.2.0/db_resnet50-adcafc63.zip',
     },
     'db_mobilenet_v3_large': {
         'mean': (0.798, 0.785, 0.772),
         'std': (0.264, 0.2749, 0.287),
+        'backbone': mobilenet_v3_large,
+        'fpn_layers': ["inverted_2", "inverted_5", "inverted_11", "final_block"],
         'input_shape': (1024, 1024, 3),
         'url': 'https://github.com/mindee/doctr/releases/download/v0.3.1/db_mobilenet_v3_large-8c16d5bf.zip',
     },
@@ -109,8 +113,7 @@ class DBNet(_DBNet, keras.Model, NestedObject):
     Args:
         feature extractor: the backbone serving as feature extractor
         fpn_channels: number of channels each extracted feature maps is mapped to
-        num_classes: number of output channels in the segmentation map
-        assume_straight_pages: if True, fit straight bounding boxes only
+        rotated_bbox: whether the segmentation map can include rotated bounding boxes
         cfg: the configuration dict of the model
     """
 
@@ -120,8 +123,7 @@ class DBNet(_DBNet, keras.Model, NestedObject):
         self,
         feature_extractor: IntermediateLayerGetter,
         fpn_channels: int = 128,  # to be set to 256 to represent the author's initial idea
-        num_classes: int = 1,
-        assume_straight_pages: bool = True,
+        rotated_bbox: bool = False,
         cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
 
@@ -129,7 +131,7 @@ class DBNet(_DBNet, keras.Model, NestedObject):
         self.cfg = cfg
 
         self.feat_extractor = feature_extractor
-        self.assume_straight_pages = assume_straight_pages
+        self.rotated_bbox = rotated_bbox
 
         self.fpn = FeaturePyramidNetwork(channels=fpn_channels)
         # Initialize kernels
@@ -142,7 +144,7 @@ class DBNet(_DBNet, keras.Model, NestedObject):
                 layers.Conv2DTranspose(64, 2, strides=2, use_bias=False, kernel_initializer='he_normal'),
                 layers.BatchNormalization(),
                 layers.Activation('relu'),
-                layers.Conv2DTranspose(num_classes, 2, strides=2, kernel_initializer='he_normal'),
+                layers.Conv2DTranspose(1, 2, strides=2, kernel_initializer='he_normal'),
             ]
         )
         self.threshold_head = keras.Sequential(
@@ -151,11 +153,11 @@ class DBNet(_DBNet, keras.Model, NestedObject):
                 layers.Conv2DTranspose(64, 2, strides=2, use_bias=False, kernel_initializer='he_normal'),
                 layers.BatchNormalization(),
                 layers.Activation('relu'),
-                layers.Conv2DTranspose(num_classes, 2, strides=2, kernel_initializer='he_normal'),
+                layers.Conv2DTranspose(1, 2, strides=2, kernel_initializer='he_normal'),
             ]
         )
 
-        self.postprocessor = DBPostProcessor(assume_straight_pages=assume_straight_pages)
+        self.postprocessor = DBPostProcessor(rotated_bbox=rotated_bbox)
 
     def compute_loss(
         self,
@@ -178,7 +180,7 @@ class DBNet(_DBNet, keras.Model, NestedObject):
         prob_map = tf.math.sigmoid(tf.squeeze(out_map, axis=[-1]))
         thresh_map = tf.math.sigmoid(tf.squeeze(thresh_map, axis=[-1]))
 
-        seg_target, seg_mask, thresh_target, thresh_mask = self.build_target(target, out_map.shape[:3])
+        seg_target, seg_mask, thresh_target, thresh_mask = self.compute_target(target, out_map.shape[:3])
         seg_target = tf.convert_to_tensor(seg_target, dtype=out_map.dtype)
         seg_mask = tf.convert_to_tensor(seg_mask, dtype=tf.bool)
         thresh_target = tf.convert_to_tensor(thresh_target, dtype=out_map.dtype)
@@ -219,7 +221,7 @@ class DBNet(_DBNet, keras.Model, NestedObject):
         x: tf.Tensor,
         target: Optional[List[np.ndarray]] = None,
         return_model_output: bool = False,
-        return_preds: bool = False,
+        return_boxes: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
 
@@ -228,15 +230,15 @@ class DBNet(_DBNet, keras.Model, NestedObject):
         logits = self.probability_head(feat_concat, **kwargs)
 
         out: Dict[str, tf.Tensor] = {}
-        if return_model_output or target is None or return_preds:
+        if return_model_output or target is None or return_boxes:
             prob_map = tf.math.sigmoid(logits)
 
         if return_model_output:
             out["out_map"] = prob_map
 
-        if target is None or return_preds:
-            # Post-process boxes (keep only text predictions)
-            out["preds"] = [preds[0] for preds in self.postprocessor(prob_map.numpy())]
+        if target is None or return_boxes:
+            # Post-process boxes
+            out["preds"] = self.postprocessor(tf.squeeze(prob_map, axis=-1).numpy())
 
         if target is not None:
             thresh_map = self.threshold_head(feat_concat, **kwargs)
@@ -249,11 +251,9 @@ class DBNet(_DBNet, keras.Model, NestedObject):
 def _db_resnet(
     arch: str,
     pretrained: bool,
-    backbone_fn,
-    fpn_layers: List[str],
-    pretrained_backbone: bool = True,
-    input_shape: Optional[Tuple[int, int, int]] = None,
-    **kwargs: Any,
+    pretrained_backbone: bool = False,
+    input_shape: Tuple[int, int, int] = None,
+    **kwargs: Any
 ) -> DBNet:
 
     pretrained_backbone = pretrained_backbone and not pretrained
@@ -264,13 +264,13 @@ def _db_resnet(
 
     # Feature extractor
     feat_extractor = IntermediateLayerGetter(
-        backbone_fn(
-            weights='imagenet' if pretrained_backbone else None,
+        _cfg['backbone'](
             include_top=False,
-            pooling=None,
+            weights='imagenet' if pretrained_backbone else None,
             input_shape=_cfg['input_shape'],
+            pooling=None,
         ),
-        fpn_layers,
+        _cfg['fpn_layers'],
     )
 
     # Build the model
@@ -285,11 +285,9 @@ def _db_resnet(
 def _db_mobilenet(
     arch: str,
     pretrained: bool,
-    backbone_fn,
-    fpn_layers: List[str],
     pretrained_backbone: bool = True,
-    input_shape: Optional[Tuple[int, int, int]] = None,
-    **kwargs: Any,
+    input_shape: Tuple[int, int, int] = None,
+    **kwargs: Any
 ) -> DBNet:
 
     pretrained_backbone = pretrained_backbone and not pretrained
@@ -300,12 +298,12 @@ def _db_mobilenet(
 
     # Feature extractor
     feat_extractor = IntermediateLayerGetter(
-        backbone_fn(
+        _cfg['backbone'](
             input_shape=_cfg['input_shape'],
             include_top=False,
             pretrained=pretrained_backbone,
         ),
-        fpn_layers,
+        _cfg['fpn_layers'],
     )
 
     # Build the model
@@ -335,13 +333,7 @@ def db_resnet50(pretrained: bool = False, **kwargs: Any) -> DBNet:
         text detection architecture
     """
 
-    return _db_resnet(
-        'db_resnet50',
-        pretrained,
-        ResNet50,
-        ["conv2_block3_out", "conv3_block4_out", "conv4_block6_out", "conv5_block3_out"],
-        **kwargs,
-    )
+    return _db_resnet('db_resnet50', pretrained, **kwargs)
 
 
 def db_mobilenet_v3_large(pretrained: bool = False, **kwargs: Any) -> DBNet:
@@ -362,10 +354,4 @@ def db_mobilenet_v3_large(pretrained: bool = False, **kwargs: Any) -> DBNet:
         text detection architecture
     """
 
-    return _db_mobilenet(
-        'db_mobilenet_v3_large',
-        pretrained,
-        mobilenet_v3_large,
-        ["inverted_2", "inverted_5", "inverted_11", "final_block"],
-        **kwargs,
-    )
+    return _db_mobilenet('db_mobilenet_v3_large', pretrained, **kwargs)

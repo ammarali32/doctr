@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -13,15 +13,6 @@ __all__ = ['get_font']
 
 
 def get_font(font_family: Optional[str] = None, font_size: int = 13) -> ImageFont.ImageFont:
-    """Resolves a compatible ImageFont for the system
-
-    Args:
-        font_family: the font family to use
-        font_size: the size of the font upon rendering
-
-    Returns:
-        the Pillow font
-    """
 
     # Font selection
     if font_family is None:

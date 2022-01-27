@@ -1,16 +1,15 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
 
 import json
 import os
-from typing import Any, List, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import numpy as np
 
-from doctr.io.image import get_img_shape
-from doctr.utils.geometry import convert_to_relative_coords
+from doctr.utils.geometry import fit_rbbox
 
 from .datasets import AbstractDataset
 
@@ -28,22 +27,19 @@ class DetectionDataset(AbstractDataset):
     Args:
         img_folder: folder with all the images of the dataset
         label_path: path to the annotations of each image
-        use_polygons: whether polygons should be considered as rotated bounding box (instead of straight ones)
-        **kwargs: keyword arguments from `AbstractDataset`.
+        sample_transforms: composable transformations that will be applied to each image
+        rotated_bbox: whether polygons should be considered as rotated bounding box (instead of straight ones)
     """
 
     def __init__(
         self,
         img_folder: str,
         label_path: str,
-        use_polygons: bool = False,
-        **kwargs: Any,
+        sample_transforms: Optional[Callable[[Any], Any]] = None,
+        rotated_bbox: bool = False,
     ) -> None:
-        super().__init__(
-            img_folder,
-            pre_transforms=lambda img, boxes: (img, convert_to_relative_coords(boxes, get_img_shape(img))),
-            **kwargs
-        )
+        super().__init__(img_folder)
+        self.sample_transforms = sample_transforms
 
         # File existence check
         if not os.path.exists(label_path):
@@ -52,13 +48,31 @@ class DetectionDataset(AbstractDataset):
             labels = json.load(f)
 
         self.data: List[Tuple[str, np.ndarray]] = []
-        np_dtype = np.float32
         for img_name, label in labels.items():
-            # File existence check
-            if not os.path.exists(os.path.join(self.root, img_name)):
-                raise FileNotFoundError(f"unable to locate {os.path.join(self.root, img_name)}")
+            polygons = np.asarray(label['polygons'])
+            if rotated_bbox:
+                # Switch to rotated rects
+                boxes = np.asarray([list(fit_rbbox(poly)) for poly in polygons])
+            else:
+                # Switch to xmin, ymin, xmax, ymax
+                boxes = np.concatenate((polygons.min(axis=1), polygons.max(axis=1)), axis=1)
 
-            polygons = np.asarray(label['polygons'], dtype=np_dtype)
-            geoms = polygons if use_polygons else np.concatenate((polygons.min(axis=1), polygons.max(axis=1)), axis=1)
+            self.data.append((img_name, np.asarray(boxes, dtype=np.float32)))
 
-            self.data.append((img_name, np.asarray(geoms, dtype=np_dtype)))
+    def __getitem__(
+        self,
+        index: int
+    ) -> Tuple[Any, np.ndarray]:
+
+        img, boxes = self._read_sample(index)
+        h, w = self._get_img_shape(img)
+        if self.sample_transforms is not None:
+            img = self.sample_transforms(img)
+
+        # Boxes
+        boxes = boxes.copy()
+        boxes[..., [0, 2]] /= w
+        boxes[..., [1, 3]] /= h
+        boxes = boxes.clip(0, 1)
+
+        return img, boxes

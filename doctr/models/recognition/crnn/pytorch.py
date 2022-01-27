@@ -1,29 +1,29 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
 
 from copy import deepcopy
 from itertools import groupby
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from doctr.datasets import VOCABS, decode_sequence
-
-from ...classification import mobilenet_v3_large_r, mobilenet_v3_small_r, vgg16_bn_r
-from ...utils.pytorch import load_pretrained_params
+from ....datasets import VOCABS, decode_sequence
+from ...backbones import mobilenet_v3_large_r, mobilenet_v3_small_r, vgg16_bn
+from ...utils import load_pretrained_params
 from ..core import RecognitionModel, RecognitionPostProcessor
 
-__all__ = ['CRNN', 'crnn_vgg16_bn', 'crnn_mobilenet_v3_small',
+__all__ = ['CRNN', 'crnn_vgg16_bn', 'CTCPostProcessor', 'crnn_mobilenet_v3_small',
            'crnn_mobilenet_v3_large']
 
 default_cfgs: Dict[str, Dict[str, Any]] = {
     'crnn_vgg16_bn': {
         'mean': (0.694, 0.695, 0.693),
         'std': (0.299, 0.296, 0.301),
+        'backbone': vgg16_bn, 'rnn_units': 128, 'lstm_features': 512,
         'input_shape': (3, 32, 128),
         'vocab': VOCABS['legacy_french'],
         'url': 'https://github.com/mindee/doctr/releases/download/v0.3.1/crnn_vgg16_bn-9762b0b0.pt',
@@ -31,6 +31,7 @@ default_cfgs: Dict[str, Dict[str, Any]] = {
     'crnn_mobilenet_v3_small': {
         'mean': (0.694, 0.695, 0.693),
         'std': (0.299, 0.296, 0.301),
+        'backbone': mobilenet_v3_small_r, 'rnn_units': 128, 'lstm_features': 576,
         'input_shape': (3, 32, 128),
         'vocab': VOCABS['french'],
         'url': "https://github.com/mindee/doctr/releases/download/v0.3.1/crnn_mobilenet_v3_small_pt-3b919a02.pt",
@@ -38,6 +39,7 @@ default_cfgs: Dict[str, Dict[str, Any]] = {
     'crnn_mobilenet_v3_large': {
         'mean': (0.694, 0.695, 0.693),
         'std': (0.299, 0.296, 0.301),
+        'backbone': mobilenet_v3_large_r, 'rnn_units': 128, 'lstm_features': 960,
         'input_shape': (3, 32, 128),
         'vocab': VOCABS['french'],
         'url': "https://github.com/mindee/doctr/releases/download/v0.3.1/crnn_mobilenet_v3_large_pt-f5259ec2.pt",
@@ -54,7 +56,7 @@ class CTCPostProcessor(RecognitionPostProcessor):
     """
     @staticmethod
     def ctc_best_path(
-        logits: torch.Tensor, vocab: str = VOCABS['french'], blank: int = 0,
+        logits: torch.Tensor, vocab: str = VOCABS['french'], blank: int = 0
     ) -> List[Tuple[str, float]]:
         """Implements best path decoding as shown by Graves (Dissertation, p63), highly inspired from
         <https://github.com/githubharald/CTCDecoder>`_.
@@ -115,8 +117,8 @@ class CRNN(RecognitionModel, nn.Module):
         self,
         feature_extractor: nn.Module,
         vocab: str,
+        lstm_features: int,
         rnn_units: int = 128,
-        input_shape: Tuple[int, int, int] = (3, 32, 128),
         cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
@@ -125,16 +127,8 @@ class CRNN(RecognitionModel, nn.Module):
         self.max_length = 32
         self.feat_extractor = feature_extractor
 
-        # Resolve the input_size of the LSTM
-        self.feat_extractor.eval()
-        with torch.no_grad():
-            out_shape = self.feat_extractor(torch.zeros((1, *input_shape))).shape
-        lstm_in = out_shape[1] * out_shape[2]
-        # Switch back to original mode
-        self.feat_extractor.train()
-
         self.decoder = nn.LSTM(
-            input_size=lstm_in, hidden_size=rnn_units, batch_first=True, num_layers=2, bidirectional=True,
+            input_size=lstm_features, hidden_size=rnn_units, batch_first=True, num_layers=2, bidirectional=True
         )
 
         # features units = 2 * rnn_units because bidirectional layers
@@ -142,10 +136,7 @@ class CRNN(RecognitionModel, nn.Module):
 
         self.postprocessor = CTCPostProcessor(vocab=vocab)
 
-        for n, m in self.named_modules():
-            # Don't override the initialization of the backbone
-            if n.startswith('feat_extractor.'):
-                continue
+        for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight.data, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
@@ -169,7 +160,7 @@ class CRNN(RecognitionModel, nn.Module):
         Returns:
             The loss of the model on the batch
         """
-        gt, seq_len = self.build_target(target)
+        gt, seq_len = self.compute_target(target)
         batch_len = model_output.shape[0]
         input_length = model_output.shape[1] * torch.ones(size=(batch_len,), dtype=torch.int32)
         # N x T x C -> T x N x C
@@ -219,25 +210,31 @@ class CRNN(RecognitionModel, nn.Module):
 def _crnn(
     arch: str,
     pretrained: bool,
-    backbone_fn: Callable[[Any], nn.Module],
     pretrained_backbone: bool = True,
-    **kwargs: Any,
+    input_shape: Optional[Tuple[int, int, int]] = None,
+    **kwargs: Any
 ) -> CRNN:
 
     pretrained_backbone = pretrained_backbone and not pretrained
 
-    # Feature extractor
-    feat_extractor = backbone_fn(pretrained=pretrained_backbone).features  # type: ignore[call-arg]
-
-    kwargs['vocab'] = kwargs.get('vocab', default_cfgs[arch]['vocab'])
-    kwargs['input_shape'] = kwargs.get('input_shape', default_cfgs[arch]['input_shape'])
-
+    # Patch the config
     _cfg = deepcopy(default_cfgs[arch])
-    _cfg['vocab'] = kwargs['vocab']
-    _cfg['input_shape'] = kwargs['input_shape']
+    _cfg['input_shape'] = input_shape or _cfg['input_shape']
+    _cfg['vocab'] = kwargs.get('vocab', _cfg['vocab'])
+    _cfg['rnn_units'] = kwargs.get('rnn_units', _cfg['rnn_units'])
+
+    # Feature extractor
+    feat_extractor = _cfg['backbone'](pretrained=pretrained_backbone)
+    # Trick to keep only the features while it's not unified between both frameworks
+    if arch.split('_')[1] == "mobilenet":
+        feat_extractor = feat_extractor.features
+
+    kwargs['vocab'] = _cfg['vocab']
+    kwargs['rnn_units'] = _cfg['rnn_units']
+    kwargs['lstm_features'] = _cfg['lstm_features']
 
     # Build the model
-    model = CRNN(feat_extractor, cfg=_cfg, **kwargs)  # type: ignore[arg-type]
+    model = CRNN(feat_extractor, cfg=_cfg, **kwargs)
     # Load pretrained parameters
     if pretrained:
         load_pretrained_params(model, _cfg['url'])
@@ -263,7 +260,7 @@ def crnn_vgg16_bn(pretrained: bool = False, **kwargs: Any) -> CRNN:
         text recognition architecture
     """
 
-    return _crnn('crnn_vgg16_bn', pretrained, vgg16_bn_r, **kwargs)
+    return _crnn('crnn_vgg16_bn', pretrained, **kwargs)
 
 
 def crnn_mobilenet_v3_small(pretrained: bool = False, **kwargs: Any) -> CRNN:
@@ -284,7 +281,7 @@ def crnn_mobilenet_v3_small(pretrained: bool = False, **kwargs: Any) -> CRNN:
         text recognition architecture
     """
 
-    return _crnn('crnn_mobilenet_v3_small', pretrained, mobilenet_v3_small_r, **kwargs)
+    return _crnn('crnn_mobilenet_v3_small', pretrained, **kwargs)
 
 
 def crnn_mobilenet_v3_large(pretrained: bool = False, **kwargs: Any) -> CRNN:
@@ -305,4 +302,4 @@ def crnn_mobilenet_v3_large(pretrained: bool = False, **kwargs: Any) -> CRNN:
         text recognition architecture
     """
 
-    return _crnn('crnn_mobilenet_v3_large', pretrained, mobilenet_v3_large_r, **kwargs)
+    return _crnn('crnn_mobilenet_v3_large', pretrained, **kwargs)

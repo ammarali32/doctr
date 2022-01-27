@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -14,7 +14,7 @@ from pathlib import Path
 
 from setuptools import find_packages, setup
 
-version = "0.5.1a0"
+version = "0.4.1a0"
 sha = 'Unknown'
 src_folder = 'doctr'
 package_index = 'python-doctr'
@@ -42,7 +42,6 @@ _deps = [
     "importlib_metadata",
     "numpy>=1.16.0",
     "scipy>=1.4.0",
-    "h5py>=3.1.0",
     "opencv-python>=3.4.5.20",
     "tensorflow>=2.4.0",
     "pyclipper>=1.2.0",
@@ -60,14 +59,12 @@ _deps = [
     # Testing
     "pytest>=5.3.2",
     "coverage>=4.5.4",
-    "hdf5storage>=0.1.18",
     "requests>=2.20.0",
     "requirements-parser==0.2.0",
     # Quality
     "flake8>=3.9.0",
     "isort>=5.7.0",
     "mypy>=0.812",
-    "pydocstyle>=6.1.1",
     # Docs
     "sphinx<3.5.0",
     "sphinx-rtd-theme==0.4.3",
@@ -89,7 +86,6 @@ install_requires = [
     deps["importlib_metadata"] + ";python_version<'3.8'",  # importlib_metadata for Python versions that don't have it
     deps["numpy"],
     deps["scipy"],
-    deps["h5py"],
     deps["opencv-python"],
     deps["pyclipper"],
     deps["shapely"],
@@ -127,15 +123,13 @@ extras["testing"] = deps_list(
     "pytest",
     "coverage",
     "requests",
-    "hdf5storage",
     "requirements-parser",
 )
 
 extras["quality"] = deps_list(
     "flake8",
     "isort",
-    "mypy",
-    "pydocstyle",
+    "mypy"
 )
 
 extras["docs_specific"] = deps_list(

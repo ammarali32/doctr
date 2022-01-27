@@ -1,9 +1,7 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
-
-from typing import Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -16,7 +14,7 @@ else:
 
 from doctr.utils.common_types import AbstractPath
 
-__all__ = ['tensor_from_pil', 'read_img_as_tensor', 'decode_img_as_tensor', 'tensor_from_numpy', 'get_img_shape']
+__all__ = ['tensor_from_pil', 'read_img_as_tensor', 'decode_img_as_tensor', 'tensor_from_numpy']
 
 
 def tensor_from_pil(pil_img: Image, dtype: tf.dtypes.DType = tf.float32) -> tf.Tensor:
@@ -103,7 +101,3 @@ def tensor_from_numpy(npy_img: np.ndarray, dtype: tf.dtypes.DType = tf.float32) 
         img = tf.clip_by_value(img, 0, 1)
 
     return img
-
-
-def get_img_shape(img: tf.Tensor) -> Tuple[int, int]:
-    return img.shape[:2]

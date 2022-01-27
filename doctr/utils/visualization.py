@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -14,8 +14,7 @@ import numpy as np
 from matplotlib.figure import Figure
 from PIL import Image, ImageDraw
 
-
-from .common_types import BoundingBox, Polygon4P
+from .common_types import BoundingBox, RotatedBbox
 from .fonts import get_font
 
 __all__ = ['visualize_page', 'synthesize_page', 'draw_boxes']
@@ -29,7 +28,6 @@ def rect_patch(
     alpha: float = 0.3,
     linewidth: int = 2,
     fill: bool = True,
-    preserve_aspect_ratio: bool = False
 ) -> patches.Rectangle:
     """Create a matplotlib rectangular patch for the element
 
@@ -41,7 +39,6 @@ def rect_patch(
         alpha: opacity parameter to fill the boxes, 0 = transparent
         linewidth: line width
         fill: whether the patch should be filled
-        preserve_aspect_ratio: pass True if you passed True to the predictor
 
     Returns:
         a rectangular Patch
@@ -54,8 +51,6 @@ def rect_patch(
     height, width = page_dimensions
     (xmin, ymin), (xmax, ymax) = geometry
     # Switch to absolute coords
-    if preserve_aspect_ratio:
-        width = height = max(height, width)
     xmin, w = xmin * width, (xmax - xmin) * width
     ymin, h = ymin * height, (ymax - ymin) * height
 
@@ -72,14 +67,13 @@ def rect_patch(
 
 
 def polygon_patch(
-    geometry: np.ndarray,
+    geometry: RotatedBbox,
     page_dimensions: Tuple[int, int],
     label: Optional[str] = None,
     color: Tuple[float, float, float] = (0, 0, 0),
     alpha: float = 0.3,
     linewidth: int = 2,
     fill: bool = True,
-    preserve_aspect_ratio: bool = False
 ) -> patches.Polygon:
     """Create a matplotlib polygon patch for the element
 
@@ -91,22 +85,24 @@ def polygon_patch(
         alpha: opacity parameter to fill the boxes, 0 = transparent
         linewidth: line width
         fill: whether the patch should be filled
-        preserve_aspect_ratio: pass True if you passed True to the predictor
 
     Returns:
         a polygon Patch
     """
 
-    if not geometry.shape == (4, 2):
+    if len(geometry) != 5 or any(not isinstance(elt, float) for elt in geometry):
         raise ValueError("invalid geometry format")
 
     # Unpack
     height, width = page_dimensions
-    geometry[:, 0] = geometry[:, 0] * (max(width, height) if preserve_aspect_ratio else width)
-    geometry[:, 1] = geometry[:, 1] * (max(width, height) if preserve_aspect_ratio else height)
+    x, y, w, h, a = geometry
+    # Switch to absolute coords
+    x, w = x * width, w * width
+    y, h = y * height, h * height
+    points = cv2.boxPoints(((x, y), (w, h), a))
 
     return patches.Polygon(
-        geometry,
+        points,
         fill=fill,
         linewidth=linewidth,
         edgecolor=(*color, alpha),
@@ -116,7 +112,7 @@ def polygon_patch(
 
 
 def create_obj_patch(
-    geometry: Union[BoundingBox, Polygon4P, np.ndarray],
+    geometry: Union[BoundingBox, RotatedBbox],
     page_dimensions: Tuple[int, int],
     **kwargs: Any,
 ) -> patches.Patch:
@@ -130,12 +126,11 @@ def create_obj_patch(
         a matplotlib Patch
     """
     if isinstance(geometry, tuple):
-        if len(geometry) == 2:  # straight word BB (2 pts)
+        if len(geometry) == 2:
             return rect_patch(geometry, page_dimensions, **kwargs)  # type: ignore[arg-type]
-        elif len(geometry) == 4:  # rotated word BB (4 pts)
-            return polygon_patch(np.asarray(geometry), page_dimensions, **kwargs)  # type: ignore[arg-type]
-    elif isinstance(geometry, np.ndarray) and geometry.shape == (4, 2):  # rotated line
-        return polygon_patch(geometry, page_dimensions, **kwargs)  # type: ignore[arg-type]
+        elif len(geometry) == 5:
+            return polygon_patch(geometry, page_dimensions, **kwargs)  # type: ignore[arg-type]
+
     raise ValueError("invalid geometry format")
 
 
@@ -285,9 +280,9 @@ def synthesize_page(
                 img = Image.new('RGB', (xmax - xmin, ymax - ymin), color=(255, 255, 255))
                 d = ImageDraw.Draw(img)
                 # Draw in black the value of the word
-
+               
                 d.text((0, 0), word["value"], font=font, fill=(0, 0, 0))
-
+                
                 # Colorize if draw_proba
                 if draw_proba:
                     p = int(255 * word["confidence"])
@@ -306,7 +301,7 @@ def synthesize_page(
 def draw_boxes(
     boxes: np.ndarray,
     image: np.ndarray,
-    color: Optional[Tuple[int, int, int]] = None,
+    color: Optional[Tuple] = None,
     **kwargs
 ) -> None:
     """Draw an array of relative straight boxes on an image
@@ -314,7 +309,6 @@ def draw_boxes(
     Args:
         boxes: array of relative boxes, of shape (*, 4)
         image: np array, float32 or uint8
-        color: color to use for bounding box edges
     """
     h, w = image.shape[:2]
     # Convert boxes to absolute coords

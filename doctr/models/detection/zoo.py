@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -15,30 +15,18 @@ __all__ = ["detection_predictor"]
 
 
 if is_tf_available():
-    ARCHS = ['db_resnet50', 'db_mobilenet_v3_large', 'linknet_resnet18']
-    ROT_ARCHS = []
+    ARCHS = ['db_resnet50', 'db_mobilenet_v3_large', 'linknet16']
 elif is_torch_available():
-    ARCHS = ['db_resnet34', 'db_resnet50', 'db_mobilenet_v3_large', 'linknet_resnet18', 'db_resnet50_rotation']
-    ROT_ARCHS = ['db_resnet50_rotation']
+    ARCHS = ['db_resnet34', 'db_resnet50', 'db_mobilenet_v3_large', 'linknet16']
 
 
-def _predictor(
-    arch: str,
-    pretrained: bool,
-    assume_straight_pages: bool = True,
-    **kwargs: Any
-) -> DetectionPredictor:
+def _predictor(arch: str, pretrained: bool, **kwargs: Any) -> DetectionPredictor:
 
     if arch not in ARCHS:
         raise ValueError(f"unknown architecture '{arch}'")
 
-    if arch not in ROT_ARCHS and not assume_straight_pages:
-        raise AssertionError("You are trying to use a model trained on straight pages while not assuming"
-                             " your pages are straight. If you have only straight documents, don't pass"
-                             f" assume_straight_pages=False, otherwise you should use one of these archs: {ROT_ARCHS}")
-
     # Detection
-    _model = detection.__dict__[arch](pretrained=pretrained, assume_straight_pages=assume_straight_pages)
+    _model = detection.__dict__[arch](pretrained=pretrained)
     kwargs['mean'] = kwargs.get('mean', _model.cfg['mean'])
     kwargs['std'] = kwargs.get('std', _model.cfg['std'])
     kwargs['batch_size'] = kwargs.get('batch_size', 1)
@@ -49,12 +37,7 @@ def _predictor(
     return predictor
 
 
-def detection_predictor(
-    arch: str = 'db_resnet50',
-    pretrained: bool = False,
-    assume_straight_pages: bool = True,
-    **kwargs: Any
-) -> DetectionPredictor:
+def detection_predictor(arch: str = 'db_resnet50', pretrained: bool = False, **kwargs: Any) -> DetectionPredictor:
     """Text detection architecture.
 
     Example::
@@ -67,10 +50,9 @@ def detection_predictor(
     Args:
         arch: name of the architecture to use (e.g. 'db_resnet50')
         pretrained: If True, returns a model pre-trained on our text detection dataset
-        assume_straight_pages: If True, fit straight boxes to the page
 
     Returns:
         Detection predictor
     """
 
-    return _predictor(arch, pretrained, assume_straight_pages, **kwargs)
+    return _predictor(arch, pretrained, **kwargs)

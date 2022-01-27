@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -6,12 +6,11 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .datasets import VisionDataset
-from .utils import convert_target_to_relative
 
 __all__ = ['FUNSD']
 
@@ -27,7 +26,8 @@ class FUNSD(VisionDataset):
 
     Args:
         train: whether the subset should be the training one
-        use_polygons: whether polygons should be considered as rotated bounding box (instead of straight ones)
+        sample_transforms: composable transformations that will be applied to each image
+        rotated_bbox: whether polygons should be considered as rotated bounding box (instead of straight ones)
         **kwargs: keyword arguments from `VisionDataset`.
     """
 
@@ -38,20 +38,14 @@ class FUNSD(VisionDataset):
     def __init__(
         self,
         train: bool = True,
-        use_polygons: bool = False,
+        sample_transforms: Optional[Callable[[Any], Any]] = None,
+        rotated_bbox: bool = False,
         **kwargs: Any,
     ) -> None:
 
-        super().__init__(
-            self.URL,
-            self.FILE_NAME,
-            self.SHA256,
-            True,
-            pre_transforms=convert_target_to_relative,
-            **kwargs
-        )
+        super().__init__(self.URL, self.FILE_NAME, self.SHA256, True, **kwargs)
         self.train = train
-        np_dtype = np.float32
+        self.sample_transforms = sample_transforms
 
         # Use the subset
         subfolder = os.path.join('dataset', 'training_data' if train else 'testing_data')
@@ -63,7 +57,6 @@ class FUNSD(VisionDataset):
             # File existence check
             if not os.path.exists(os.path.join(tmp_root, img_path)):
                 raise FileNotFoundError(f"unable to locate {os.path.join(tmp_root, img_path)}")
-
             stem = Path(img_path).stem
             with open(os.path.join(self.root, subfolder, 'annotations', f"{stem}.json"), 'rb') as f:
                 data = json.load(f)
@@ -71,21 +64,15 @@ class FUNSD(VisionDataset):
             _targets = [(word['text'], word['box']) for block in data['form']
                         for word in block['words'] if len(word['text']) > 0]
             text_targets, box_targets = zip(*_targets)
-            if use_polygons:
-                # xmin, ymin, xmax, ymax -> (x, y) coordinates of top left, top right, bottom right, bottom left corners
+            if rotated_bbox:
+                # box_targets: xmin, ymin, xmax, ymax -> x, y, w, h, alpha = 0
                 box_targets = [
                     [
-                        [box[0], box[1]],
-                        [box[2], box[1]],
-                        [box[2], box[3]],
-                        [box[0], box[3]],
+                        (box[0] + box[2]) / 2, (box[1] + box[3]) / 2, box[2] - box[0], box[3] - box[1], 0
                     ] for box in box_targets
                 ]
 
-            self.data.append((
-                img_path,
-                dict(boxes=np.asarray(box_targets, dtype=np_dtype), labels=list(text_targets)),
-            ))
+            self.data.append((img_path, dict(boxes=np.asarray(box_targets, dtype=int), labels=text_targets)))
 
         self.root = tmp_root
 

@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2022, Mindee.
+# Copyright (C) 2021, Mindee.
 
 # This program is licensed under the Apache License version 2.
 # See LICENSE or go to <https://www.apache.org/licenses/LICENSE-2.0.txt> for full license details.
@@ -8,95 +8,24 @@ import os
 os.environ['USE_TORCH'] = '1'
 
 import datetime
-import logging
 import multiprocessing as mp
 import time
+import logging
 
 import numpy as np
 import torch
-import wandb
+from contiguous_params import ContiguousParams
 from fastprogress.fastprogress import master_bar, progress_bar
 from torch.nn.functional import cross_entropy
-from torch.optim.lr_scheduler import CosineAnnealingLR, MultiplicativeLR, OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
-from torchvision.transforms import (ColorJitter, Compose, GaussianBlur, Grayscale, InterpolationMode, Normalize,
-                                    RandomRotation)
+from torchvision import models
+from torchvision.transforms import ColorJitter, Compose, Normalize, RandomPerspective
+from utils import plot_samples
 
+import wandb
 from doctr import transforms as T
 from doctr.datasets import VOCABS, CharacterGenerator
-from doctr.models import classification
-from utils import plot_recorder, plot_samples
-
-
-def record_lr(
-    model: torch.nn.Module,
-    train_loader: DataLoader,
-    batch_transforms,
-    optimizer,
-    start_lr: float = 1e-7,
-    end_lr: float = 1,
-    num_it: int = 100,
-    amp: bool = False,
-):
-    """Gridsearch the optimal learning rate for the training.
-    Adapted from https://github.com/frgfm/Holocron/blob/master/holocron/trainer/core.py
-    """
-
-    if num_it > len(train_loader):
-        raise ValueError("the value of `num_it` needs to be lower than the number of available batches")
-
-    model = model.train()
-    # Update param groups & LR
-    optimizer.defaults['lr'] = start_lr
-    for pgroup in optimizer.param_groups:
-        pgroup['lr'] = start_lr
-
-    gamma = (end_lr / start_lr) ** (1 / (num_it - 1))
-    scheduler = MultiplicativeLR(optimizer, lambda step: gamma)
-
-    lr_recorder = [start_lr * gamma ** idx for idx in range(num_it)]
-    loss_recorder = []
-
-    if amp:
-        scaler = torch.cuda.amp.GradScaler()
-
-    for batch_idx, (images, targets) in enumerate(train_loader):
-        if torch.cuda.is_available():
-            images = images.cuda()
-            targets = targets.cuda()
-
-        images = batch_transforms(images)
-
-        # Forward, Backward & update
-        optimizer.zero_grad()
-        if amp:
-            with torch.cuda.amp.autocast():
-                out = model(images)
-                train_loss = cross_entropy(out, targets)
-            scaler.scale(train_loss).backward()
-            # Update the params
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            out = model(images)
-            train_loss = cross_entropy(out, targets)
-            train_loss.backward()
-            optimizer.step()
-        # Update LR
-        scheduler.step()
-
-        # Record
-        if not torch.isfinite(train_loss):
-            if batch_idx == 0:
-                raise ValueError("loss value is NaN or inf.")
-            else:
-                break
-        loss_recorder.append(train_loss.item())
-        # Stop after the number of iterations
-        if batch_idx + 1 == num_it:
-            break
-
-    return lr_recorder[:len(loss_recorder)], loss_recorder
 
 
 def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, mb, amp=False):
@@ -105,8 +34,10 @@ def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, m
         scaler = torch.cuda.amp.GradScaler()
 
     model.train()
+    train_iter = iter(train_loader)
     # Iterate over the batches of the dataset
-    for images, targets in progress_bar(train_loader, parent=mb):
+    for _ in progress_bar(range(len(train_loader)), parent=mb):
+        images, targets = next(train_iter)
 
         if torch.cuda.is_available():
             images = images.cuda()
@@ -139,7 +70,8 @@ def evaluate(model, val_loader, batch_transforms, amp=False):
     model.eval()
     # Validation loop
     val_loss, correct, samples, batch_cnt = 0, 0, 0, 0
-    for images, targets in val_loader:
+    val_iter = iter(val_loader)
+    for images, targets in val_iter:
         images = batch_transforms(images)
 
         if torch.cuda.is_available():
@@ -176,20 +108,14 @@ def main(args):
 
     vocab = VOCABS[args.vocab]
 
-    fonts = args.font.split(",")
-
     # Load val data generator
     st = time.time()
     val_set = CharacterGenerator(
         vocab=vocab,
         num_samples=args.val_samples * len(vocab),
         cache_samples=True,
-        img_transforms=Compose([
-            T.Resize((args.input_size, args.input_size)),
-            # Ensure we have a 90% split of white-background images
-            T.RandomApply(T.ColorInversion(), .9),
-        ]),
-        font_family=fonts,
+        sample_transforms=T.Resize((args.input_size, args.input_size)),
+        font_family=args.font,
     )
     val_loader = DataLoader(
         val_set,
@@ -205,7 +131,7 @@ def main(args):
     batch_transforms = Normalize(mean=(0.694, 0.695, 0.693), std=(0.299, 0.296, 0.301))
 
     # Load doctr model
-    model = classification.__dict__[args.arch](pretrained=args.pretrained, num_classes=len(vocab))
+    model = models.__dict__[args.arch](pretrained=args.pretrained, num_classes=len(vocab))
 
     # Resume weights
     if isinstance(args.resume, str):
@@ -241,17 +167,14 @@ def main(args):
         vocab=vocab,
         num_samples=args.train_samples * len(vocab),
         cache_samples=True,
-        img_transforms=Compose([
+        sample_transforms=Compose([
             T.Resize((args.input_size, args.input_size)),
             # Augmentations
-            T.RandomApply(T.ColorInversion(), .9),
-            # GaussianNoise
-            T.RandomApply(Grayscale(3), .1),
+            RandomPerspective(),
+            T.RandomApply(T.ColorInversion(), .7),
             ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.02),
-            T.RandomApply(GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 3)), .3),
-            RandomRotation(15, interpolation=InterpolationMode.BILINEAR),
         ]),
-        font_family=fonts,
+        font_family=args.font,
     )
 
     train_loader = DataLoader(
@@ -271,14 +194,9 @@ def main(args):
         return
 
     # Optimizer
-    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], args.lr,
+    model_params = ContiguousParams([p for p in model.parameters() if p.requires_grad]).contiguous()
+    optimizer = torch.optim.Adam(model_params, args.lr,
                                  betas=(0.95, 0.99), eps=1e-6, weight_decay=args.weight_decay)
-
-    # LR Finder
-    if args.find_lr:
-        lrs, losses = record_lr(model, train_loader, batch_transforms, optimizer, amp=args.amp)
-        plot_recorder(lrs, losses)
-        return
     # Scheduler
     if args.sched == 'cosine':
         scheduler = CosineAnnealingLR(optimizer, args.epochs * len(train_loader), eta_min=args.lr / 25e4)
@@ -350,12 +268,7 @@ def parse_args():
     parser.add_argument('--wd', '--weight-decay', default=0, type=float, help='weight decay', dest='weight_decay')
     parser.add_argument('-j', '--workers', type=int, default=None, help='number of workers used for dataloading')
     parser.add_argument('--resume', type=str, default=None, help='Path to your checkpoint')
-    parser.add_argument(
-        '--font',
-        type=str,
-        default="FreeMono.ttf,FreeSans.ttf,FreeSerif.ttf",
-        help='Font family to be used'
-    )
+    parser.add_argument('--font', type=str, default="FreeMono.ttf", help='Font family to be used')
     parser.add_argument('--vocab', type=str, default="french", help='Vocab to be used for training')
     parser.add_argument(
         '--train-samples',
@@ -380,7 +293,6 @@ def parse_args():
                         help='Load pretrained parameters before starting the training')
     parser.add_argument('--sched', type=str, default='cosine', help='scheduler to use')
     parser.add_argument("--amp", dest="amp", help="Use Automatic Mixed Precision", action="store_true")
-    parser.add_argument('--find-lr', action='store_true', help='Gridsearch the optimal LR')
     args = parser.parse_args()
 
     return args
