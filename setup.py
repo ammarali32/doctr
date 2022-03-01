@@ -46,7 +46,7 @@ _deps = [
     "tensorflow>=2.4.0",
     "pyclipper>=1.2.0",
     "shapely>=1.6.0",
-    "matplotlib>=3.1.0,<3.4.3",
+    "matplotlib==3.5.0",
     "mplcursors>=0.3",
     "tensorflow-cpu>=2.4.0",
     "torch>=1.8.0",
