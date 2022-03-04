@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import cv2
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
-import mplcursors
 import numpy as np
 from matplotlib.figure import Figure
 from PIL import Image, ImageDraw
@@ -236,9 +235,7 @@ def visualize_page(
                 if interactive:
                     artists.append(rect)
 
-    if interactive:
-        # Create mlp Cursor to hover patches in artists
-        mplcursors.Cursor(artists, hover=2).connect("add", lambda sel: sel.annotation.set_text(sel.artist.get_label()))
+    
     fig.tight_layout(pad=0.)
 
     return fig
